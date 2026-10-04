@@ -1,0 +1,54 @@
+name: agent
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync workspace
+        run: uv sync --all-packages
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Mypy
+        run: uv run mypy shared agent
+
+      - name: Pytest
+        run: uv run pytest -q
+
+      - name: PyInstaller build
+        working-directory: agent
+        run: uv run pyinstaller djutil-agent.spec --noconfirm --clean
+
+      - name: Smoke test binary
+        shell: bash
+        run: |
+          BIN=agent/dist/djutil-agent
+          [ "${{ runner.os }}" = "Windows" ] && BIN="$BIN.exe"
+          "$BIN" --version
+          "$BIN" --help
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: djutil-agent-${{ matrix.os }}
+          path: agent/dist/djutil-agent*
+          if-no-files-found: error

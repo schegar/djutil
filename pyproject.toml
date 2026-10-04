@@ -1,0 +1,62 @@
+[project]
+name = "djutil"
+version = "0.1.0"
+description = "DJUtil workspace root"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["shared", "agent", "server"]
+
+[tool.uv.sources]
+djutil-shared = { workspace = true }
+djutil-agent = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pyinstaller>=6.10",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["shared/src", "agent/src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "typer.Option", "typer.Argument",
+    "fastapi.Depends", "fastapi.Query", "fastapi.Path",
+]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = [".", "shared/src", "agent/src", "server/src"]
+explicit_package_bases = true
+packages = ["djutil_shared", "djutil_agent", "djutil_server"]
+strict = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "test_camelot", "test_reader", "test_watcher", "test_paths", "conftest",
+    "tests.*", "*.tests", "*.tests.*",
+    "agent.tests.*", "server.tests.*", "shared.tests.*",
+]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+
+[tool.pytest.ini_options]
+testpaths = ["shared/tests", "agent/tests", "server/tests"]
+addopts = "--import-mode=importlib"
+pythonpath = ["server/tests"]
+timeout = 30

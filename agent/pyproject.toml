@@ -1,0 +1,30 @@
+[project]
+name = "djutil-agent"
+version = "0.1.0"
+description = "DJUtil Rekordbox 6/7 integration agent"
+requires-python = ">=3.12"
+dependencies = [
+    "djutil-shared",
+    "pyrekordbox==0.4.4",
+    "sqlalchemy>=2.0",
+    "platformdirs>=4.0",
+    "typer>=0.12",
+    "httpx>=0.27",
+    "watchdog>=4.0",
+    "websockets>=14.0",
+    "pystray==0.19.5",
+    "pillow==11.3.0",
+]
+
+[project.scripts]
+djutil-agent = "djutil_agent.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/djutil_agent"]
+
+[tool.uv.sources]
+djutil-shared = { workspace = true }
