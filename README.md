@@ -76,6 +76,54 @@ To run a published image instead of building locally, keep the default
 `docker compose pull && docker compose up -d`. To build locally instead, use
 `docker compose up -d --build`.
 
+> **Quoting the password hash:** the argon2 hash contains `$`, which Compose
+> interpolates in `env_file`/`.env`. Always paste it **single-quoted**:
+> `DJUTIL_ADMIN_PASSWORD_HASH='$argon2id$v=19$...'`.
+
+## Deploy behind an existing Traefik
+
+If the VPS already runs Traefik, use `deploy/docker-compose.traefik.yml`
+instead — it labels the app for Traefik (`websecure` entrypoint,
+`myresolver` certresolver) and joins the external `traefik-net`. No Caddy is
+deployed; WebSockets (`/api/live/ws`, `/api/agent/ws`) work through Traefik
+with no extra configuration.
+
+```bash
+# 1. Get the code on the VPS
+git clone <repo> djutil && cd djutil/deploy
+#    (alternative: build locally and ship the image:
+#     docker build -f deploy/Dockerfile -t djutil:local . &&
+#     docker save djutil:local | ssh vps docker load)
+
+# 2. Configure
+cp .env.example .env
+openssl rand -hex 32   # -> DJUTIL_AGENT_TOKEN
+openssl rand -hex 32   # -> DJUTIL_SESSION_SECRET
+#    set DJUTIL_DOMAIN (e.g. djutil.example.com) and DJUTIL_TZ
+
+# 3. Admin password hash — wrap it in SINGLE quotes in .env
+docker compose -f docker-compose.traefik.yml run --rm djutil \
+  python -m djutil_server hash-password
+
+# 4. The container runs as uid 10001 — prepare bind mounts
+mkdir -p data backups && sudo chown -R 10001:10001 data backups
+#    (if /data isn't writable, the app exits with a clear error naming this fix)
+
+# 5. Build + start
+docker compose -f docker-compose.traefik.yml up -d --build
+
+# 6. Verify
+curl https://<domain>/api/health
+```
+
+Then point the agent at it:
+
+```bash
+djutil-agent configure --server https://<domain> --token <DJUTIL_AGENT_TOKEN>
+djutil-agent sync --full
+djutil-agent tray    # or enable autostart
+```
+
 ## Agent setup (DJ machine)
 
 Download the release zip for your OS from **Releases**

@@ -1,0 +1,35 @@
+# VCS / editor
+.git/
+.github/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Node / web build outputs (installed fresh inside the image)
+node_modules/
+web/node_modules/
+web/dist/
+web/dev-dist/
+web/test-results/
+web/playwright-report/
+web/e2e/screenshots/
+
+# Local data, backups, and secrets
+data/
+backups/
+deploy/.env
+*.dump.json
+library.json
+
+# PyInstaller artifacts
+agent/build/
+agent/dist/

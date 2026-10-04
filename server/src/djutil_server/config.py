@@ -41,8 +41,22 @@ class Settings(BaseSettings):
         return v
 
     def ensure_dirs(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.artwork_dir.mkdir(parents=True, exist_ok=True)
+        # Fail with a clear message instead of a cryptic traceback when the
+        # data dir (e.g. a bind-mounted volume) isn't writable.
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.artwork_dir.mkdir(parents=True, exist_ok=True)
+            probe = self.data_dir / ".write-test"
+            probe.touch()
+            probe.unlink()
+        except OSError as exc:
+            import sys
+
+            sys.exit(
+                f"DJUTIL_DATA_DIR {self.data_dir} is not writable: {exc}. "
+                "If this is a bind mount, chown it to the container user "
+                "(uid 10001): sudo chown -R 10001:10001 data backups"
+            )
 
 
 @lru_cache

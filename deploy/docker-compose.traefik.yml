@@ -1,0 +1,50 @@
+# DJUtil behind an existing Traefik (external `traefik-net`, websecure +
+# myresolver). `docker compose -f docker-compose.traefik.yml up -d --build`
+# from this directory; see README "Deploy behind an existing Traefik".
+
+services:
+  djutil:
+    image: ${DJUTIL_IMAGE:-djutil:local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: djutil
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=${DJUTIL_TZ:-Europe/Berlin}
+    volumes:
+      - ./data:/data
+    networks:
+      - traefik-net
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.djutil.rule=Host(`${DJUTIL_DOMAIN}`)
+      - traefik.http.routers.djutil.entrypoints=websecure
+      - traefik.http.routers.djutil.tls.certresolver=myresolver
+      - traefik.http.services.djutil.loadbalancer.server.port=8000
+      # the backup container is on the default network, so tell Traefik
+      # explicitly which network to reach the app on
+      - traefik.docker.network=traefik-net
+
+  djutil-backup:
+    image: ${DJUTIL_IMAGE:-djutil:local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: djutil-backup
+    restart: unless-stopped
+    env_file: .env
+    command:
+      [
+        "python", "-m", "djutil_server", "backup",
+        "--dir", "/backups", "--keep", "14", "--loop-hours", "24",
+      ]
+    volumes:
+      - ./data:/data:ro
+      - ./backups:/backups
+    # default network only — not reachable through Traefik
+
+networks:
+  traefik-net:
+    external: true
