@@ -19,6 +19,8 @@ class StatusSnapshot:
     last_error: str | None = None
     last_play: str | None = None
     recording: bool = False
+    # "active (7.2.10)" | "no offsets" | "not running" | "off" | None
+    deck_reader: str | None = None
 
     def icon_color(self) -> str:
         """red = error/unconfigured, amber = connecting/retrying, green = ok."""
@@ -40,6 +42,8 @@ class StatusSnapshot:
             parts.append(f"last sync {local:%H:%M} ({ok})")
         else:
             parts.append("no sync yet")
+        if self.deck_reader:
+            parts.append(f"decks: {self.deck_reader}")
         if self.last_play:
             parts.append(f"last play: {self.last_play}")
         if self.last_error:
@@ -81,6 +85,9 @@ class AgentStatus:
 
     def set_last_play(self, label: str | None) -> None:
         self._set(last_play=label)
+
+    def set_deck_reader(self, state: str | None) -> None:
+        self._set(deck_reader=state)
 
     def set_recording(self, recording: bool) -> None:
         self._set(recording=recording)

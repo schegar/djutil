@@ -7,10 +7,14 @@ import contextlib
 import json
 import logging
 import socket
+from datetime import UTC
+from pathlib import Path
 from urllib.parse import urlparse
 
 import websockets
 from websockets.asyncio.client import ClientConnection
+
+from djutil_shared import PlayEvent
 
 from .. import __version__
 from ..rekordbox.watcher import HistoryWatcher
@@ -38,6 +42,8 @@ class LiveForwarder:
         token: str,
         rb_version: str | None = None,
         status: object | None = None,
+        deck_watcher: object | None = None,
+        play_log: Path | None = None,
     ) -> None:
         self.watcher = watcher
         self.outbox = outbox
@@ -45,6 +51,8 @@ class LiveForwarder:
         self.token = token
         self.rb_version = rb_version
         self.status = status
+        self.deck_watcher = deck_watcher
+        self.play_log = play_log
         self._ws_failures = 0
         self._stop = asyncio.Event()
         self._new = asyncio.Event()  # set when the outbox gains an event
@@ -155,25 +163,92 @@ class LiveForwarder:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff)
                 backoff = min(backoff * 2, _MAX_BACKOFF)
 
+    _CSV_HEADER = (
+        "detected_at", "played_at", "latency_s", "history_entry_id",
+        "history_id", "content_id", "artist", "title",
+    )
+
+    def _log_plays(self, events: list[PlayEvent]) -> None:
+        """Mirror `djutil-agent watch`: append events to play_events.csv."""
+        import csv
+
+        if self.play_log is None or not events:
+            return
+        try:
+            new_file = not self.play_log.exists()
+            with self.play_log.open("a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(self._CSV_HEADER)
+                for ev in events:
+                    t = ev.track
+                    latency = (
+                        (ev.detected_at - ev.played_at).total_seconds()
+                        if ev.played_at
+                        else None
+                    )
+                    w.writerow(
+                        [
+                            ev.detected_at.isoformat(),
+                            (
+                                ev.played_at.astimezone(UTC).isoformat()
+                                if ev.played_at
+                                else ""
+                            ),
+                            f"{latency:.3f}" if latency is not None else "",
+                            ev.history_entry_id,
+                            ev.history_id,
+                            ev.content_id,
+                            t.artist if t else "",
+                            t.title if t else "",
+                        ]
+                    )
+        except OSError:
+            logger.exception("play event log write failed")
+
+    def _enqueue(self, events: list[PlayEvent]) -> None:
+        for event in events:
+            self.outbox.put(event)
+            self._new.set()  # wake the connected loop to flush
+            if self.status is not None:
+                t = event.track
+                label = (
+                    f"{t.artist} - {t.title}"
+                    if t is not None
+                    else event.content_id
+                )
+                self.status.set_last_play(label)  # type: ignore[attr-defined]
+        self._log_plays(events)
+
     async def _poll_loop(self) -> None:
         while not self._stop.is_set():
-            for event in self.watcher.poll():
-                self.outbox.put(event)
-                self._new.set()  # wake the connected loop to flush
-                if self.status is not None:
-                    t = event.track
-                    label = (
-                        f"{t.artist} - {t.title}"
-                        if t is not None
-                        else event.content_id
-                    )
-                    self.status.set_last_play(label)  # type: ignore[attr-defined]
+            self._enqueue(self.watcher.poll())
             await asyncio.sleep(1.0)
+
+    async def _deck_loop(self) -> None:
+        assert self.deck_watcher is not None
+        while not self._stop.is_set():
+            try:
+                events = await asyncio.to_thread(
+                    self.deck_watcher.poll  # type: ignore[attr-defined]
+                )
+            except Exception:
+                logger.exception("deck watcher poll failed")
+                events = []
+            if self.status is not None:
+                self.status.set_deck_reader(  # type: ignore[attr-defined]
+                    self.deck_watcher.state  # type: ignore[attr-defined]
+                )
+            self._enqueue(events)
+            await asyncio.sleep(0.2)
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
         self.watcher.prime()
-        await asyncio.gather(self._poll_loop(), self._ws_loop())
+        loops = [self._poll_loop(), self._ws_loop()]
+        if self.deck_watcher is not None:
+            loops.append(self._deck_loop())
+        await asyncio.gather(*loops)
 
     def stop(self) -> None:
         if self._loop is not None and self._loop.is_running():

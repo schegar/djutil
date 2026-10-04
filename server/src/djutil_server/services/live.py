@@ -19,6 +19,15 @@ GAP = timedelta(minutes=30)
 # Same track replayed within 90 s doesn't count as a new set entry.
 DUP_WINDOW = timedelta(seconds=90)
 
+# A "shadow" play is a deck event linked onto an already-ingested history
+# play of the same track — it records the precise mix-in time/deck, but the
+# history row already represents the play for counting/session purposes.
+NOT_SHADOW = (
+    "NOT (p.source = 'deck' AND p.rb_history_entry_id IS NOT NULL"
+    " AND EXISTS (SELECT 1 FROM plays h"
+    " WHERE h.history_entry_id = p.rb_history_entry_id))"
+)
+
 Clock = Callable[[], datetime]
 
 
@@ -224,6 +233,7 @@ def ingest_play(
     plays, run set logic, return what changed for the publisher.
     """
     changed: dict[str, Any] = {"inserted": False, "set_changed": False}
+    is_deck = event.source == "deck"
     with engine.begin() as conn:
         existing = conn.execute(
             text("SELECT id, set_id FROM plays WHERE history_entry_id = :h"),
@@ -231,6 +241,16 @@ def ingest_play(
         ).first()
         if existing:
             return changed
+        if not is_deck:
+            # a deck play already linked to this Rekordbox history row
+            already = conn.execute(
+                text(
+                    "SELECT id FROM plays WHERE rb_history_entry_id = :h"
+                ),
+                {"h": event.history_entry_id},
+            ).first()
+            if already:
+                return changed
 
         played_at = _as_dt(event.played_at or event.detected_at)
         now = clock()
@@ -259,20 +279,86 @@ def ingest_play(
                     {**{c: data.get(c) for c in cols}, "synced_at": now},
                 )
 
-        # Mirror the Rekordbox history row.
-        conn.execute(
-            text(
-                "INSERT INTO rb_history_entries (id, history_id, content_id,"
-                " track_no, created_at) VALUES (:id, :h, :c, NULL, :ca)"
-                " ON CONFLICT(id) DO NOTHING"
-            ),
-            {
-                "id": event.history_entry_id,
-                "h": event.history_id,
-                "c": event.content_id,
-                "ca": played_at,
-            },
-        )
+        if not is_deck:
+            # Mirror the Rekordbox history row.
+            conn.execute(
+                text(
+                    "INSERT INTO rb_history_entries (id, history_id,"
+                    " content_id, track_no, created_at) VALUES"
+                    " (:id, :h, :c, NULL, :ca) ON CONFLICT(id) DO NOTHING"
+                ),
+                {
+                    "id": event.history_entry_id,
+                    "h": event.history_id,
+                    "c": event.content_id,
+                    "ca": played_at,
+                },
+            )
+            # Link to an unlinked deck play of the same track. Rekordbox
+            # writes history rows late, so the deck event usually wins.
+            deck_play = conn.execute(
+                text(
+                    "SELECT id FROM plays WHERE source = 'deck'"
+                    " AND track_id = :t AND rb_history_entry_id IS NULL"
+                    " AND played_at >= :lo AND played_at <= :hi"
+                    " ORDER BY played_at DESC, id DESC LIMIT 1"
+                ),
+                {
+                    "t": event.content_id,
+                    "lo": played_at - timedelta(minutes=15),
+                    "hi": played_at + timedelta(minutes=2),
+                },
+            ).first()
+            if deck_play:
+                conn.execute(
+                    text(
+                        "UPDATE plays SET rb_history_entry_id = :h"
+                        " WHERE id = :p"
+                    ),
+                    {"h": event.history_entry_id, "p": deck_play.id},
+                )
+                changed["linked"] = True
+                return changed
+        else:
+            # Link to an unlinked history play of the same track (the
+            # deck event arrived after its history row was ingested).
+            hp = conn.execute(
+                text(
+                    "SELECT p.id, p.history_entry_id, p.set_id FROM plays p"
+                    " WHERE p.source = 'history' AND p.track_id = :t"
+                    " AND p.played_at >= :lo AND p.played_at <= :hi"
+                    " AND NOT EXISTS (SELECT 1 FROM plays d"
+                    "  WHERE d.rb_history_entry_id = p.history_entry_id)"
+                    " ORDER BY p.played_at DESC, p.id DESC LIMIT 1"
+                ),
+                {
+                    "t": event.content_id,
+                    "lo": played_at - timedelta(minutes=15),
+                    "hi": played_at + timedelta(minutes=15),
+                },
+            ).first()
+            if hp:
+                conn.execute(
+                    text(
+                        "INSERT INTO plays (history_entry_id, track_id,"
+                        " history_id, played_at, detected_at, set_id,"
+                        " source, deck, rb_history_entry_id) VALUES"
+                        " (:h, :t, :hs, :pa, :da, :sid, 'deck', :d, :rb)"
+                    ),
+                    {
+                        "h": event.history_entry_id,
+                        "t": event.content_id,
+                        "hs": event.history_id,
+                        "pa": played_at,
+                        "da": _as_dt(event.detected_at),
+                        "sid": hp.set_id,
+                        "d": event.deck,
+                        "rb": hp.history_entry_id,
+                    },
+                )
+                changed["inserted"] = True
+                changed["linked"] = True
+                return changed
 
         # Close a stale set before deciding where this play lands. The gap is
         # measured against the play's own timestamp; the background sweeper
@@ -292,8 +378,8 @@ def ingest_play(
         res = conn.execute(
             text(
                 "INSERT INTO plays (history_entry_id, track_id, history_id,"
-                " played_at, detected_at, set_id) VALUES"
-                " (:h, :t, :hs, :pa, :da, :sid)"
+                " played_at, detected_at, set_id, source, deck) VALUES"
+                " (:h, :t, :hs, :pa, :da, :sid, :src, :d)"
             ),
             {
                 "h": event.history_entry_id,
@@ -302,6 +388,8 @@ def ingest_play(
                 "pa": played_at,
                 "da": _as_dt(event.detected_at),
                 "sid": s["id"] if s else None,
+                "src": event.source,
+                "d": event.deck,
             },
         )
         if s:
@@ -328,8 +416,9 @@ def live_state(engine: Engine, hub: LiveHub) -> dict[str, Any]:
             # plays since the last >30min gap
             rows = conn.execute(
                 text(
-                    "SELECT track_id, played_at FROM plays"
-                    " ORDER BY played_at DESC, id DESC LIMIT 200"
+                    "SELECT track_id, played_at FROM plays p WHERE "
+                    + NOT_SHADOW
+                    + " ORDER BY played_at DESC, id DESC LIMIT 200"
                 )
             ).mappings().all()
             session_rows = []

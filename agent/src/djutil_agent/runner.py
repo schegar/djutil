@@ -143,6 +143,23 @@ def run_engine(
     live_thread: threading.Thread | None = None
     try:
         live_reader = RekordboxReader(open_rekordbox(path, key))
+        deck_watcher = None
+        if cfg.deck_reader:
+            from .rbmem.deckwatch import DeckWatcher
+            from .rbmem.scan import DbTrack, build_db_map
+
+            def db_map(
+                path: Path = path, key: str | None = key
+            ) -> dict[str, DbTrack]:  # noqa: B008
+                engine = open_rekordbox(path, key)
+                try:
+                    return build_db_map(
+                        RekordboxReader(engine).analysis_index()
+                    )
+                finally:
+                    engine.dispose()
+
+            deck_watcher = DeckWatcher(db_map)
         forwarder = LiveForwarder(
             HistoryWatcher(live_reader),
             Outbox(agent_data_dir() / "outbox.db"),
@@ -150,6 +167,8 @@ def run_engine(
             cfg.token,
             rb_version=rekordbox_version(),
             status=status,
+            deck_watcher=deck_watcher,
+            play_log=agent_data_dir() / "play_events.csv",
         )
         live_thread = threading.Thread(
             target=lambda: asyncio.run(forwarder.run()),

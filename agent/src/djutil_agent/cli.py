@@ -266,9 +266,16 @@ def _sync_engine() -> tuple[SyncEngine, Path]:
 def configure(
     server: str = typer.Option(..., "--server", help="Server base URL"),
     token: str = typer.Option(..., "--token", help="Agent bearer token"),
+    deck_reader: bool = typer.Option(
+        True,
+        "--deck-reader/--no-deck-reader",
+        help="Read deck state from Rekordbox memory (instant now-playing)",
+    ),
 ) -> None:
     """Store the server URL and agent token in the agent data dir."""
-    path = save_config(AgentConfig(server=server, token=token))
+    path = save_config(
+        AgentConfig(server=server, token=token, deck_reader=deck_reader)
+    )
     typer.echo(f"Wrote {path}")
 
 
@@ -611,21 +618,15 @@ def decks_watch(
     """Print live deck state (title/BPM/position/fader) until Ctrl+C."""
     import contextlib
 
-    from djutil_agent.rbmem.fader import read_fader
+    from djutil_agent.rbmem.deckwatch import read_deck
     from djutil_agent.rbmem.nowplaying import (
         DeckSample,
         NowPlayingTracker,
         is_playing,
     )
     from djutil_agent.rbmem.offsets import SAMPLE_RATE, load_offsets
-    from djutil_agent.rbmem.pointer import (
-        read_cstr,
-        read_f32,
-        read_i64,
-        read_u8,
-    )
+    from djutil_agent.rbmem.pointer import read_u8
     from djutil_agent.rbmem.process import MemoryReadError
-    from djutil_agent.rbmem.scan import norm_anlz_path
 
     proc = _open_rekordbox_process()
     version = proc.version or _rekordbox_version() or ""
@@ -663,49 +664,26 @@ def decks_watch(
                 with contextlib.suppress(MemoryReadError):
                     master = read_u8(proc, offs.master_index)
             for d in range(len(offs.anlz_path)):
-                try:
-                    raw = read_cstr(proc, offs.anlz_path[d], 500)
-                except MemoryReadError:
+                r = read_deck(proc, offs, db, d)
+                if r is None:
                     continue
-                norm = norm_anlz_path(raw)
-                track = db.get(norm) if norm else None
-                title = None
-                if offs.track_info:
-                    with contextlib.suppress(MemoryReadError):
-                        info = read_cstr(proc, offs.track_info[d], 200)
-                        title = info.split("\n")[0].strip() or None
-                title = title or (track.title if track else "?")
-                bpm = pos = None
-                if offs.bpm:
-                    with contextlib.suppress(MemoryReadError):
-                        bpm = read_f32(proc, offs.bpm[d])
-                if offs.position:
-                    with contextlib.suppress(MemoryReadError):
-                        pos = read_i64(proc, offs.position[d])
-                fader = None
-                if (
-                    offs.fader
-                    and d < len(offs.fader)
-                    and offs.fader[d] is not None
-                ):
-                    fp = offs.fader[d]
-                    assert fp is not None
-                    fader = read_fader(proc, fp)
-                cid = track.content_id if track else None
-                key = cid or norm
                 pkey, ppos = prev.get(d, (None, None))
-                playing = is_playing(pkey, ppos, key, pos)
-                prev[d] = (key, pos)
+                playing = is_playing(pkey, ppos, r.key, r.pos)
+                prev[d] = (r.key, r.pos)
                 samples.append(
-                    DeckSample(cid or key, title or "?", playing, fader)
+                    DeckSample(r.cid or r.key, r.title, playing, r.fader)
                 )
                 mark = "*" if master == d else " "
-                pos_s = f"{pos / SAMPLE_RATE:.2f}s" if pos is not None else "?"
-                fad_s = f"{fader:.2f}" if fader is not None else "?"
+                pos_s = (
+                    f"{r.pos / SAMPLE_RATE:.2f}s"
+                    if r.pos is not None
+                    else "?"
+                )
+                fad_s = f"{r.fader:.2f}" if r.fader is not None else "?"
                 parts.append(
                     f"{mark}d{d} {'PLAY' if playing else '    '} "
-                    f"{title} bpm={bpm if bpm is not None else '?'} "
-                    f"pos={pos_s} fader={fad_s} cid={cid or '-'}"
+                    f"{r.title} bpm={r.bpm if r.bpm is not None else '?'} "
+                    f"pos={pos_s} fader={fad_s} cid={r.cid or '-'}"
                 )
             assert offs.anlz_path is not None
             ev = tracker.update(now, wall_now, samples)

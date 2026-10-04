@@ -26,6 +26,7 @@ from .schemas import (
     TrackOut,
     TrackSummary,
 )
+from .services.live import NOT_SHADOW
 
 router = APIRouter(prefix="/api", tags=["library"], dependencies=[Depends(require_user)])
 
@@ -36,8 +37,9 @@ _TRACK_COLS = (
     " t.file_path, t.file_name, t.file_type, t.bitrate, t.sample_rate,"
     " t.release_year, t.release_date, t.date_added, t.artwork_hash,"
     " t.updated_at,"
-    " (SELECT COUNT(*) FROM plays p WHERE p.track_id = t.id)"
-    " AS app_play_count"
+    " (SELECT COUNT(*) FROM plays p WHERE p.track_id = t.id AND "
+    + NOT_SHADOW
+    + ") AS app_play_count"
 )
 
 _SORTS = {

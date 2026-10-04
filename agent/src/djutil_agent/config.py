@@ -18,6 +18,7 @@ ENV_TOKEN = "DJUTIL_AGENT_TOKEN"
 class AgentConfig:
     server: str = ""
     token: str = ""
+    deck_reader: bool = True
 
     @property
     def configured(self) -> bool:
@@ -36,6 +37,7 @@ def load_config() -> AgentConfig:
             data = json.loads(path.read_text(encoding="utf-8"))
             cfg.server = str(data.get("server", ""))
             cfg.token = str(data.get("token", ""))
+            cfg.deck_reader = bool(data.get("deck_reader", True))
         except (json.JSONDecodeError, OSError):
             pass
     cfg.server = os.environ.get(ENV_SERVER, cfg.server)
@@ -46,7 +48,14 @@ def load_config() -> AgentConfig:
 def save_config(cfg: AgentConfig) -> Path:
     path = config_path()
     path.write_text(
-        json.dumps({"server": cfg.server, "token": cfg.token}, indent=2),
+        json.dumps(
+            {
+                "server": cfg.server,
+                "token": cfg.token,
+                "deck_reader": cfg.deck_reader,
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
     if os.name == "posix":

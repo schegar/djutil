@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -170,3 +171,7 @@ class PlayEvent(_Model):
     played_at: datetime | None = None  # djmdSongHistory.created_at
     detected_at: datetime
     track: Track | None = None
+    # "deck" events come from the process-memory deck reader (instant);
+    # "history" events mirror djmdSongHistory rows (late, replay-blind).
+    source: Literal["history", "deck"] = "history"
+    deck: int | None = None  # 0-based deck index for deck events

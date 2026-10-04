@@ -309,3 +309,155 @@ def test_set_name_uses_tz(seeded, app):
 
     expected = datetime.now(UTC).astimezone(ZoneInfo("Pacific/Auckland"))
     assert name == f"Set {expected.strftime('%Y-%m-%d %H:%M')}"
+
+
+# -- deck/history merge ----------------------------------------------------------
+
+
+def dev(i, tid="t1", minutes=0, base=None, deck=0, seconds=0):
+    played = (base or datetime(2026, 10, 1, 20, 0, tzinfo=UTC)) + timedelta(
+        minutes=minutes, seconds=seconds
+    )
+    return {
+        "history_entry_id": f"deck:{i:032x}",
+        "history_id": "deck",
+        "content_id": tid,
+        "played_at": played.isoformat(),
+        "detected_at": played.isoformat(),
+        "source": "deck",
+        "deck": deck,
+    }
+
+
+def _plays(seeded, settings):
+    import sqlite3
+
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM plays ORDER BY played_at, id"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def test_deck_then_history_links(seeded, settings):
+    """Deck event first, Rekordbox history row 70 s later -> linked, one
+    play row, one set entry."""
+    seeded.post("/api/agent/events", json=[dev(1, "t1")])
+    h = ev(1, "t1", base=datetime(2026, 10, 1, 20, 1, 10, tzinfo=UTC))
+    r = seeded.post("/api/agent/events", json=[h])
+    # linked, not inserted
+    assert r.json()["ingested"] == 0
+    plays = _plays(seeded, settings)
+    assert len(plays) == 1
+    assert plays[0]["source"] == "deck"
+    assert plays[0]["deck"] == 0
+    assert plays[0]["rb_history_entry_id"] == "he-1"
+    s = seeded.get("/api/sets").json()
+    assert len(s) == 1
+    assert seeded.get(f"/api/sets/{s[0]['id']}").json()["entry_count"] == 1
+
+
+def test_deck_replay_second_set_entry(seeded, settings):
+    """Same track replayed 10 min later (a history session would miss it)
+    -> second deck play + second set entry."""
+    seeded.post("/api/agent/events",
+                json=[dev(1, "t1"), dev(2, "t1", minutes=10)])
+    plays = _plays(seeded, settings)
+    assert len(plays) == 2
+    assert all(p["source"] == "deck" for p in plays)
+    s = seeded.get("/api/sets").json()
+    assert seeded.get(f"/api/sets/{s[0]['id']}").json()["entry_count"] == 2
+
+
+def test_history_20min_after_deck_new_play(seeded, settings):
+    """History outside the merge window stays its own play."""
+    seeded.post("/api/agent/events", json=[dev(1, "t1")])
+    h = ev(1, "t1", base=datetime(2026, 10, 1, 20, 20, 0, tzinfo=UTC))
+    seeded.post("/api/agent/events", json=[h])
+    plays = _plays(seeded, settings)
+    assert len(plays) == 2
+    assert {p["source"] for p in plays} == {"deck", "history"}
+
+
+def test_deck_after_history_no_new_set_entry(seeded, settings):
+    """History ingested first; a late deck event links to it without a
+    second set entry."""
+    seeded.post("/api/agent/events", json=[ev(1, "t1")])
+    r = seeded.post("/api/agent/events",
+                    json=[dev(1, "t1", seconds=30, deck=1)])
+    assert r.json()["ingested"] == 1
+    plays = _plays(seeded, settings)
+    assert len(plays) == 2
+    deck_play = [p for p in plays if p["source"] == "deck"][0]
+    assert deck_play["rb_history_entry_id"] == "he-1"
+    s = seeded.get("/api/sets").json()
+    assert seeded.get(f"/api/sets/{s[0]['id']}").json()["entry_count"] == 1
+
+
+def test_linked_shadow_not_double_counted(seeded, settings):
+    """A deck shadow play linked to a history play doesn't double-count in
+    app_play_count or the live-state session fallback."""
+    # auto_record off first: no set is created, so the live-state session
+    # falls back to the raw plays table where the shadow would show.
+    seeded.put("/api/live/auto-record", json={"auto_record": False})
+    seeded.post("/api/agent/events", json=[ev(1, "t1")])
+    seeded.post("/api/agent/events", json=[dev(1, "t1", seconds=30, deck=1)])
+    assert len(_plays(seeded, settings)) == 2  # history + shadow deck play
+    assert seeded.get("/api/tracks/t1").json()["app_play_count"] == 1
+    st = seeded.get("/api/live/state").json()
+    assert [s["track"]["id"] for s in st["session"]] == ["t1"]
+
+
+def test_history_dup_after_link_noop(seeded, settings):
+    """A history event already linked onto a deck play is a no-op."""
+    seeded.post("/api/agent/events", json=[dev(1, "t1")])
+    h = ev(1, "t1", base=datetime(2026, 10, 1, 20, 1, 0, tzinfo=UTC))
+    seeded.post("/api/agent/events", json=[h])
+    r = seeded.post("/api/agent/events", json=[h])  # same row again
+    assert r.json()["ingested"] == 0
+    assert len(_plays(seeded, settings)) == 1
+
+
+def test_history_source_column(seeded, settings):
+    seeded.post("/api/agent/events", json=[ev(1, "t1")])
+    plays = _plays(seeded, settings)
+    assert plays[0]["source"] == "history"
+    assert plays[0]["deck"] is None
+
+
+def test_migration_0002_to_0003_preserves_data(tmp_path):
+    """A database already at 0002 upgrades cleanly; plays keep their rows."""
+    from alembic import command
+    from alembic.config import Config
+    from djutil_server.db import ALEMBIC_DIR, make_engine
+    from sqlalchemy import text
+
+    engine = make_engine(tmp_path / "mig.db")
+    cfg = Config()
+    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+    cfg.attributes["engine"] = engine
+
+    command.upgrade(cfg, "0002_live_sets")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO plays (history_entry_id, track_id, history_id,"
+                " played_at, detected_at, set_id) VALUES"
+                " ('he-old', 't1', 'h1', '2026-01-01 20:00:00',"
+                "  '2026-01-01 20:00:00', NULL)"
+            )
+        )
+    command.upgrade(cfg, "head")
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT source, deck, rb_history_entry_id FROM plays"
+                " WHERE history_entry_id = 'he-old'"
+            )
+        ).first()
+        assert row is not None
+        assert row[0] == "history" and row[1] is None and row[2] is None
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(plays)"))}
+        assert {"source", "deck", "rb_history_entry_id"} <= cols

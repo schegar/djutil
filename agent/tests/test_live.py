@@ -322,3 +322,87 @@ def test_forwarder_delivers_second_event_without_reconnect(tmp_path, live_server
     r = httpx.post(f"{live_server}/api/auth/login", json={"password": "e2epw"})
     s = httpx.get(f"{live_server}/api/live/state", cookies=r.cookies).json()
     assert len(s["session"]) == 2
+
+
+# -- deck watcher integration ---------------------------------------------------
+
+
+class FakeDeckWatcher:
+    """DeckWatcher stand-in: drains a queued event list each poll."""
+
+    def __init__(self, events: list[PlayEvent] | None = None) -> None:
+        self.events = list(events or [])
+        self.state = "active (7.2.10)"
+
+    def poll(self) -> list[PlayEvent]:
+        out, self.events = self.events, []
+        return out
+
+
+def deck_ev(i: int) -> PlayEvent:
+    return PlayEvent(
+        history_entry_id=f"deck:{i:032x}",
+        history_id="deck",
+        content_id=f"t-{i}",
+        played_at=datetime(2026, 1, 1, 20, i, tzinfo=UTC),
+        detected_at=datetime(2026, 1, 1, 20, i, 1, tzinfo=UTC),
+        source="deck",
+        deck=1,
+    )
+
+
+def test_deck_loop_enqueues_outbox_and_logs(tmp_path):
+    """_deck_loop puts deck events in the outbox and mirrors the CSV log."""
+    f = make_forwarder(tmp_path)
+    f.deck_watcher = FakeDeckWatcher([deck_ev(1)])
+    f.play_log = tmp_path / "play_events.csv"
+
+    async def go():
+        task = asyncio.create_task(f._deck_loop())
+        for _ in range(50):
+            if f.outbox.pending():
+                break
+            await asyncio.sleep(0.05)
+        f.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    asyncio.run(asyncio.wait_for(go(), timeout=10))
+    pending = f.outbox.pending()
+    assert len(pending) == 1
+    assert pending[0].source == "deck" and pending[0].deck == 1
+    rows = f.play_log.read_text().strip().splitlines()
+    assert len(rows) == 2  # header + one event
+    assert "deck:00000000000000000000000000000001" in rows[1]
+
+
+def test_deck_events_flush_over_ws(tmp_path, live_server):
+    """Deck events go through the same WS path and get acked."""
+    f = LiveForwarder(
+        FakeWatcher(),  # type: ignore[arg-type]
+        Outbox(tmp_path / "outbox.db"),
+        live_server,
+        "e2e-token",
+        rb_version="7.2.10",
+        deck_watcher=FakeDeckWatcher([deck_ev(2)]),
+        play_log=tmp_path / "play_events.csv",
+    )
+
+    async def go():
+        task = asyncio.create_task(f.run())
+        await asyncio.sleep(4)
+        f.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    asyncio.run(asyncio.wait_for(go(), timeout=15))
+    assert f.outbox.pending() == []  # sent + acked by the server
+
+    r = httpx.post(f"{live_server}/api/auth/login", json={"password": "e2epw"})
+    s = httpx.get(f"{live_server}/api/live/state", cookies=r.cookies).json()
+    assert len(s["session"]) == 1
+    # deck event carried no track payload, so the summary is None — the
+    # play itself must be recorded.
+    assert s["session"][0]["played_at"]

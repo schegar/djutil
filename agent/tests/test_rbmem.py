@@ -989,3 +989,105 @@ def test_now_playing_no_fader_fallback():
     tr.update(0.0, 0.0, [DeckSample("A", "t", True, None)])
     ev = tr.update(6.0, 6.0, [DeckSample("A", "t", True, None)])
     assert ev is not None and ev.deck == 0
+
+
+# -- deckwatch ------------------------------------------------------------------
+
+
+def _deckwatch_setup() -> tuple[FakeMemory, DeckOffsets, int, int]:
+    """One planted deck: ANLZ path, i64 position, f64 fader."""
+    from djutil_agent.rbmem.offsets import FaderPointer
+
+    mem = FakeMemory()
+    anlz_slot = 0x3000
+    _plant_anlz(mem, anlz_slot, 0, "PIONEER/USBANLZ/A/1/ANLZ0000.DAT")
+    pos_slot = 0x3100
+    pos_addr = mem.alloc(16)
+    mem.write_u64(mem.module_base + pos_slot, pos_addr)
+    fad_slot = 0x3200
+    fad_addr = mem.alloc(16)
+    mem.write_u64(mem.module_base + fad_slot, fad_addr)
+    mem.write_f64(fad_addr, 1.0)
+    offs = DeckOffsets(
+        anlz_path=[Pointer.parse(f"{anlz_slot:X} 8 3F0 0")],
+        position=[Pointer((pos_slot,), 0)],
+        fader=[FaderPointer((Pointer((fad_slot,), 0),), "f64")],
+    )
+    return mem, offs, pos_addr, fad_addr
+
+
+def _i64(v: int) -> bytes:
+    return v.to_bytes(8, "little", signed=True)
+
+
+def test_deckwatcher_emits_deck_event(monkeypatch):
+    import djutil_agent.rbmem.deckwatch as dw
+
+    mem, offs, pos_addr, _fad = _deckwatch_setup()
+    db = {
+        "PIONEER/USBANLZ/A/1/ANLZ0000.DAT": DbTrack("c1", "Song One", 128.0)
+    }
+    monkeypatch.setattr(dw, "load_offsets", lambda _v: offs)
+    t = [0.0]
+    w = [1000.0]
+    watch = dw.DeckWatcher(
+        lambda: db,
+        proc_factory=lambda: mem,
+        mono=lambda: t[0],
+        wall=lambda: w[0],
+    )
+
+    def step(dt: float, pos: int | None = None) -> None:
+        t[0] += dt
+        w[0] += dt
+        if pos is not None:
+            mem.write(pos_addr, _i64(pos))
+
+    mem.write(pos_addr, _i64(100_000))
+    events = []
+    step(0.0)                                    # t=0: load only, not playing
+    events += watch.poll()
+    for i in range(1, 8):                        # t=1..7: playing, fader up
+        step(1.0, 100_000 + i * 44_100)
+        events += watch.poll()
+
+    assert watch.state.startswith("active")
+    assert len(events) == 1
+    e = events[0]
+    assert e.source == "deck" and e.deck == 0
+    assert e.content_id == "c1"
+    assert e.history_entry_id.startswith("deck:")
+    assert e.history_id == "deck"
+    from datetime import UTC, datetime
+
+    assert e.played_at == datetime.fromtimestamp(1001.0, UTC)
+
+
+def test_deckwatcher_process_not_running():
+    from djutil_agent.rbmem.deckwatch import DeckWatcher
+    from djutil_agent.rbmem.process import MemoryReader, ProcessNotFoundError
+
+    def fail() -> MemoryReader:
+        raise ProcessNotFoundError("no rekordbox.exe")
+
+    watch = DeckWatcher(lambda: {}, proc_factory=fail)
+    assert watch.poll() == []
+    assert watch.state == "not running"
+
+
+def test_deckwatcher_no_offsets_logs_once(monkeypatch, caplog):
+    import logging
+
+    import djutil_agent.rbmem.deckwatch as dw
+
+    mem = FakeMemory()
+    monkeypatch.setattr(dw, "load_offsets", lambda _v: None)
+    t = [0.0]
+    watch = dw.DeckWatcher(lambda: {}, proc_factory=lambda: mem,
+                           mono=lambda: t[0])
+    with caplog.at_level(logging.INFO):
+        assert watch.poll() == []
+        assert watch.poll() == []
+    assert watch.state == "no offsets"
+    msgs = [r for r in caplog.records if "no offsets" in r.getMessage()]
+    assert len(msgs) == 1
