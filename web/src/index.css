@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@theme {
+  --color-booth: #0a0a0b;
+  --color-booth-panel: #131316;
+  --color-booth-border: #26262b;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-neutral-950 text-neutral-100 antialiased;
+}
