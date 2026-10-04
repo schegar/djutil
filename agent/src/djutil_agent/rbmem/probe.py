@@ -189,16 +189,24 @@ class Chain:
     inners: list[int]
     content_id: str
     title: str
+    final: int = 0
 
     def text(self) -> str:
         return " ".join(
-            [f"{self.module_off:X}", *(f"{i:X}" for i in self.inners), "0"]
+            [
+                f"{self.module_off:X}",
+                *(f"{i:X}" for i in self.inners),
+                f"{self.final:X}",
+            ]
         )
+
+    def pointer(self) -> Pointer:
+        return Pointer((self.module_off, *self.inners), self.final)
 
 
 def reverse_walk(
     reader: MemoryReader,
-    holders: dict[int, tuple[DbTrack | None, list[int]]],
+    holders: dict[int, tuple[DbTrack | None, list[int], int | None]],
     *,
     depth: int = DEPTH,
     cap: int = FRONTIER_CAP,
@@ -209,17 +217,19 @@ def reverse_walk(
 ) -> list[Chain]:
     """BFS: holder address -> parent qword whose value is a struct base.
 
-    ``holders`` maps a found field address to (track, accumulated inner
-    offsets).  Each level finds locations whose value V satisfies
-    ``holder - rng <= V <= holder``; the inner offset is ``holder - V``.
+    ``holders`` maps a found address to ``(track, inner offsets so far,
+    final)``.  ``final`` is ``None`` when the holder is the *value field*
+    itself (e.g. a fader float): the first level's computed offset then
+    becomes the chain's final addend instead of a deref offset.  Otherwise
+    the holder contains a pointer and each level prepends a deref offset.
     Parents inside the module complete a chain.
     """
     import numpy as np
 
     mod_lo = reader.module_base
     mod_hi = reader.module_base + reader.module_size
-    found: dict[int, Chain] = {}
-    frontier = dict(holders)  # addr -> (track, chain-so-far)
+    found: dict[tuple[int, tuple[int, ...], int], Chain] = {}
+    frontier = dict(holders)  # addr -> (track, chain-so-far, final)
 
     for level in range(1, depth + 1):
         if not frontier:
@@ -227,8 +237,10 @@ def reverse_walk(
         t0 = time.monotonic()
         hs = np.array(sorted(frontier), dtype="<u8")
         hs64 = hs.astype(np.int64)
-        # collected: (inner, addr, track, chain)
-        cand: list[tuple[int, int, DbTrack | None, list[int]]] = []
+        # collected: (inner, addr, track, chain, final)
+        cand: list[
+            tuple[int, int, DbTrack | None, list[int], int]
+        ] = []
         for base, data in iter_memory(reader, chunk=chunk,
                                       max_region=max_region):
             start, arr = _u8_view(base, data)
@@ -251,24 +263,32 @@ def reverse_walk(
                     d = h - v
                     if d > rng:
                         break
-                    track, chain = frontier[h]
-                    cand.append((d, addr, track, [d, *chain]))
+                    track, chain, fin = frontier[h]
+                    if fin is None:
+                        # value-field seed: d is its offset in the struct
+                        cand.append((d, addr, track, chain, d))
+                    else:
+                        cand.append((d, addr, track, [d, *chain], fin))
                     j += 1
         # cap: smallest inner offsets first, dedupe by address
         cand.sort(key=lambda c: (c[0], c[1]))
-        new_frontier: dict[int, tuple[DbTrack | None, list[int]]] = {}
-        for _inner, addr, track, chain in cand:
+        new_frontier: dict[
+            int, tuple[DbTrack | None, list[int], int | None]
+        ] = {}
+        for _inner, addr, track, chain, fin in cand:
             if addr in new_frontier:
                 continue
-            new_frontier[addr] = (track, chain)
+            new_frontier[addr] = (track, chain, fin)
             if mod_lo <= addr < mod_hi:
                 off = addr - mod_lo
-                if off not in found or len(chain) < len(found[off].inners):
-                    found[off] = Chain(
+                key = (off, tuple(chain), fin)
+                if key not in found:
+                    found[key] = Chain(
                         module_off=off,
                         inners=chain,
                         content_id=track.content_id if track else "?",
                         title=track.title if track else "?",
+                        final=fin,
                     )
             if len(new_frontier) >= cap:
                 break
@@ -404,7 +424,9 @@ def _continue_probe(
     )
     total_refs = sum(len(v) for v in holders.values())
     echo(f"  {total_refs} pointer(s) to {len(targets)} seed string(s)")
-    holder_map: dict[int, tuple[DbTrack | None, list[int]]] = {}
+    holder_map: dict[
+        int, tuple[DbTrack | None, list[int], int | None]
+    ] = {}
     s_to_hit = {h.addr: h for h in seeds}
     for s, addrs in holders.items():
         hit = s_to_hit.get(s)
@@ -416,7 +438,7 @@ def _continue_probe(
             )
             if hit is not None and hit.track is not None:
                 echo(f"    {loc} -> {hit.text!r} ({hit.track.title})")
-            holder_map[a] = (hit.track if hit else None, [])
+            holder_map[a] = (hit.track if hit else None, [], 0)
     if not holder_map:
         echo("  nobody points at the strings - cannot walk back.")
         echo(f"  total elapsed {time.monotonic() - t0:.1f}s")

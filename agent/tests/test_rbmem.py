@@ -62,6 +62,9 @@ class FakeMemory:
     def readable_regions(self) -> list[tuple[int, int]]:
         return sorted(self.regions)
 
+    def writable_regions(self) -> list[tuple[int, int]]:
+        return sorted(self.regions)
+
     def _in_region(self, addr: int, size: int) -> bool:
         return any(
             b <= addr and addr + size <= b + n for b, n in self.regions
@@ -397,7 +400,7 @@ def test_probe_reverse_walk_recovers_chain():
     assert holders[s] == [sb + 0x88]
     chains = reverse_walk(
         mem,
-        {sb + 0x88: (track, [])},
+        {sb + 0x88: (track, [], 0)},
         echo=lambda _m: None,
         chunk=1 << 16,
     )
@@ -574,3 +577,249 @@ def test_probe_validate_finds_deck_variant():
     assert "Song One" in joined          # the chain resolves
     assert "Song Two" in joined          # +8 on level 1 reveals deck 2
     assert "0x8+0x8" in joined
+
+
+# -- fader-scan -------------------------------------------------------------------
+
+
+def _fader_mem() -> FakeMemory:
+    mem = _probe_mem()
+    mem.regions = [(mem.module_base, 0x40000), (HEAP_BASE, 0x8000)]
+    return mem
+
+
+def _plant_fader(mem: FakeMemory, enc: str) -> int:
+    """Plant ``module+0x2100 -> obj --(+0x40)--> struct --(+0x88)--> float``.
+    Returns the fader value address.  A >0x1000 gap separates obj and
+    struct so the module static is not a direct (shorter) parent of the
+    fader field."""
+    obj = mem.alloc(0x40)
+    mem.write_u64(mem.module_base + 0x2100, obj)
+    mem.alloc(0x2000)  # gap: F - obj must exceed the reverse-walk range
+    struct_addr = mem.alloc(0x100)
+    mem.write_u64(obj + 0x40, struct_addr)
+    addr = struct_addr + 0x88
+    if enc == "f32":
+        mem.write_f32(addr, 1.0)
+    else:
+        mem.write_f64(addr, 1.0)
+    return addr
+
+
+def test_fader_scan_f32(tmp_path):
+    from djutil_agent.rbmem.fader import fader_scan, save_fader
+
+    mem = _fader_mem()
+    fader_addr = _plant_fader(mem, "f32")
+    decoy = mem.alloc(0x20)
+    mem.write_f32(decoy, 1.0)  # 1.0/0.0 but never takes the half value
+
+    real = iter([1.0, 0.0, 0.5, 1.0, 0.2])
+    fake = iter([1.0, 0.0, 0.0, 0.0, 0.0])
+
+    def fake_input(_msg: str) -> str:
+        mem.write_f32(fader_addr, next(real))
+        mem.write_f32(decoy, next(fake))
+        return ""
+
+    res = fader_scan(
+        mem, 1, prompt=fake_input, echo=lambda _m: None, chunk=1 << 16
+    )
+    assert res.encoding == "f32"
+    assert res.pointer == Pointer((0x2100, 0x40), 0x88)
+    assert res.pointer.resolve(mem) == fader_addr
+
+    # save merges into an existing entry without clobbering other fields
+    offs = DeckOffsets.from_bases(anlz_base=0x588CB08)
+    path = tmp_path / "rbmem_offsets.json"
+    save_offsets("7.2.10", offs, path)
+    assert save_fader(
+        "7.2.10", 1, res.pointer, "f32", path, echo=lambda _m: None
+    )
+    got = load_offsets("7.2.10", path)
+    assert got is not None and got.fader is not None
+    assert got.fader[0] is not None
+    assert got.fader[0].pointer == res.pointer
+    assert got.fader[0].encoding == "f32"
+    assert got.anlz_path == offs.anlz_path
+    # refused without a saved entry
+    assert not save_fader(
+        "9.9.9", 1, res.pointer, "f32", path, echo=lambda _m: None
+    )
+
+
+def test_fader_scan_f64():
+    from djutil_agent.rbmem.fader import fader_scan
+
+    mem = _fader_mem()
+    _plant_fader(mem, "f64")
+
+    vals = iter([1.0, 0.0, 0.5])
+
+    def fake_input(_msg: str) -> str:
+        # find the planted addr each step via the chain
+        addr = Pointer((0x2100, 0x40), 0x88).resolve(mem)
+        mem.write_f64(addr, next(vals))
+        return ""
+
+    res = fader_scan(
+        mem, 2, prompt=fake_input, echo=lambda _m: None, chunk=1 << 16
+    )
+    assert res.encoding == "f64"
+    assert res.pointer == Pointer((0x2100, 0x40), 0x88)
+
+
+# -- now-playing -------------------------------------------------------------------
+
+
+def test_is_playing():
+    from djutil_agent.rbmem.nowplaying import is_playing
+
+    # load: content id changed, position dropped -> not playing
+    assert not is_playing("a", 21000, "b", 0)
+    # same track, sample count advanced -> playing
+    assert is_playing("a", 21000, "a", 22050)
+    # same track, position unchanged -> not playing
+    assert not is_playing("a", 21000, "a", 21000)
+    # first sighting / unloaded -> not playing
+    assert not is_playing(None, None, "a", 5)
+    assert not is_playing("a", 100, None, 200)
+
+
+def test_now_playing_tracker_blend():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    def d(cid: str, playing: bool, fader: float | None) -> DeckSample:
+        return DeckSample(cid, "t-" + cid, playing, fader)
+
+    tr = NowPlayingTracker(min_audible_s=5.0)
+    # A audible from t=0, qualifies at t=5
+    assert tr.update(0.0, 1000.0, [d("A", True, 1.0), d("B", False, 0.0)]) is None
+    ev = tr.update(6.0, 1006.0, [d("A", True, 1.0), d("B", False, 0.0)])
+    assert ev is not None
+    assert ev.deck == 0 and ev.cid == "A" and ev.audible_since == 0.0
+    assert ev.wall_since == 1000.0
+    # B becomes audible at t=10; after 5 s audible it wins (latest start)
+    assert tr.update(10.0, 1010.0,
+                     [d("A", True, 1.0), d("B", True, 1.0)]) is None
+    assert tr.update(14.9, 1014.9,
+                     [d("A", True, 1.0), d("B", True, 1.0)]) is None
+    ev = tr.update(15.5, 1015.5,
+                   [d("A", True, 1.0), d("B", True, 1.0)])
+    assert ev is not None and ev.deck == 1
+    assert ev.audible_since == 10.0
+    assert ev.wall_since == pytest.approx(1010.0)
+
+
+def test_now_playing_fader_drops_before_min():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    def d(cid: str, playing: bool, fader: float | None) -> DeckSample:
+        return DeckSample(cid, "t", playing, fader)
+
+    tr = NowPlayingTracker(min_audible_s=5.0)
+    tr.update(0.0, 0.0, [d("A", True, 1.0), d("B", False, 0.0)])
+    assert tr.update(6.0, 6.0,
+                     [d("A", True, 1.0), d("B", False, 0.0)]) is not None
+    # B comes up then drops before qualifying -> A kept, no switch
+    tr.update(10.0, 10.0, [d("A", True, 1.0), d("B", True, 1.0)])
+    tr.update(12.0, 12.0, [d("A", True, 1.0), d("B", True, 0.0)])
+    assert tr.update(16.0, 16.0,
+                     [d("A", True, 1.0), d("B", True, 0.0)]) is None
+
+
+def test_now_playing_replay_is_new_event():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    def d(cid: str, playing: bool, fader: float | None) -> DeckSample:
+        return DeckSample(cid, "t", playing, fader)
+
+    tr = NowPlayingTracker(min_audible_s=5.0)
+    tr.update(0.0, 0.0, [d("A", True, 1.0)])
+    ev1 = tr.update(6.0, 6.0, [d("A", True, 1.0)])
+    assert ev1 is not None
+    # pause longer than the gap grace -> audible window resets; the resume
+    # must re-qualify for min_audible_s before it fires (new since)
+    tr.update(7.0, 7.0, [d("A", False, 1.0)])
+    assert tr.update(20.0, 20.0, [d("A", True, 1.0)]) is None
+    ev2 = tr.update(25.0, 25.0, [d("A", True, 1.0)])
+    assert ev2 is not None
+    assert ev2.cid == "A" and ev2.audible_since == 20.0
+    assert ev2.audible_since != ev1.audible_since
+    assert tr.update(26.0, 26.0, [d("A", True, 1.0)]) is None
+
+
+def test_now_playing_short_gap_keeps_event():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    def d(cid: str, playing: bool, fader: float | None) -> DeckSample:
+        return DeckSample(cid, "t", playing, fader)
+
+    tr = NowPlayingTracker(min_audible_s=5.0, gap_grace_s=3.0)
+    tr.update(0.0, 0.0, [d("A", True, 1.0)])
+    ev = tr.update(6.0, 6.0, [d("A", True, 1.0)])
+    assert ev is not None and ev.audible_since == 0.0
+    # pause 1 s (within grace) then resume: same since, no new event
+    tr.update(8.0, 8.0, [d("A", False, 1.0)])
+    assert tr.update(9.0, 9.0, [d("A", True, 1.0)]) is None
+    assert tr.update(12.0, 12.0, [d("A", True, 1.0)]) is None
+
+
+def test_now_playing_gap_beyond_grace_replays():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    def d(cid: str, playing: bool, fader: float | None) -> DeckSample:
+        return DeckSample(cid, "t", playing, fader)
+
+    tr = NowPlayingTracker(min_audible_s=5.0, gap_grace_s=3.0)
+    tr.update(0.0, 0.0, [d("A", True, 1.0)])
+    assert tr.update(6.0, 6.0, [d("A", True, 1.0)]) is not None
+    # pause 5 s (> grace) -> entry dropped; the resume is a new event
+    tr.update(8.0, 8.0, [d("A", False, 1.0)])
+    assert tr.update(12.0, 12.0, [d("A", False, 1.0)]) is None
+    assert tr.update(13.0, 13.0, [d("A", True, 1.0)]) is None
+    ev = tr.update(18.0, 18.0, [d("A", True, 1.0)])
+    assert ev is not None and ev.audible_since == 13.0
+    assert tr.update(24.0, 24.0, [d("A", True, 1.0)]) is None
+
+
+def test_now_playing_one_sample_stall_ignored():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    def d(cid: str, playing: bool, fader: float | None) -> DeckSample:
+        return DeckSample(cid, "t", playing, fader)
+
+    tr = NowPlayingTracker(min_audible_s=5.0, gap_grace_s=3.0)
+    tr.update(0.0, 0.0, [d("A", True, 1.0)])
+    ev = tr.update(6.0, 6.0, [d("A", True, 1.0)])
+    assert ev is not None
+    # single stalled sample (loop jump / failed read) -> no change
+    tr.update(6.2, 6.2, [d("A", False, 1.0)])
+    assert tr.update(6.4, 6.4, [d("A", True, 1.0)]) is None
+    assert tr.update(10.0, 10.0, [d("A", True, 1.0)]) is None
+
+
+def test_now_playing_no_reemit_after_drop():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    def d(cid: str, playing: bool, fader: float | None) -> DeckSample:
+        return DeckSample(cid, "t", playing, fader)
+
+    tr = NowPlayingTracker(min_audible_s=5.0, gap_grace_s=3.0)
+    tr.update(0.0, 0.0, [d("A", True, 1.0)])
+    ev = tr.update(6.0, 6.0, [d("A", True, 1.0)])
+    assert ev is not None
+    # deck goes silent past the grace; nothing audible -> no re-emit
+    tr.update(7.0, 7.0, [d("A", False, 1.0)])
+    assert tr.update(11.0, 11.0, [d("A", False, 1.0)]) is None
+    assert tr.update(12.0, 12.0, [d("A", False, 1.0)]) is None
+
+
+def test_now_playing_no_fader_fallback():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    tr = NowPlayingTracker(min_audible_s=5.0)
+    # fader unknown -> playing alone decides
+    tr.update(0.0, 0.0, [DeckSample("A", "t", True, None)])
+    ev = tr.update(6.0, 6.0, [DeckSample("A", "t", True, None)])
+    assert ev is not None and ev.deck == 0

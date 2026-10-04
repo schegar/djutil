@@ -48,6 +48,10 @@ class MemoryReader(Protocol):
         """(base, size) pairs of readable committed memory."""
         ...
 
+    def writable_regions(self) -> list[tuple[int, int]]:
+        """(base, size) pairs of committed memory the process may write."""
+        ...
+
 
 def _check_platform() -> None:
     if sys.platform != "win32" or k32 is None:
@@ -66,6 +70,16 @@ PROCESS_VM_READ = 0x0010
 MEM_COMMIT = 0x1000
 PAGE_NOACCESS = 0x01
 PAGE_GUARD = 0x100
+PAGE_READWRITE = 0x04
+PAGE_WRITECOPY = 0x08
+PAGE_EXECUTE_READWRITE = 0x40
+PAGE_EXECUTE_WRITECOPY = 0x80
+WRITABLE = (
+    PAGE_READWRITE
+    | PAGE_WRITECOPY
+    | PAGE_EXECUTE_READWRITE
+    | PAGE_EXECUTE_WRITECOPY
+)
 MAX_PATH = 260
 
 
@@ -177,7 +191,7 @@ class WindowsProcess:
             )
         self._exe_path: str | None = None
         self._module_base, self._module_size = self._find_module()
-        self._regions: list[tuple[int, int]] | None = None
+        self._regions: list[tuple[int, int, int]] | None = None
         self._version = _file_version(self._exe_path) if self._exe_path else None
         if self._version is None:
             try:
@@ -262,11 +276,11 @@ class WindowsProcess:
             )
         return bytes(buf)
 
-    def readable_regions(self) -> list[tuple[int, int]]:
-        """Committed, accessible regions via VirtualQueryEx (cached)."""
+    def _query_regions(self) -> list[tuple[int, int, int]]:
+        """(base, size, protect) of committed, accessible regions (cached)."""
         if self._regions is not None:
             return self._regions
-        regions: list[tuple[int, int]] = []
+        regions: list[tuple[int, int, int]] = []
         mbi = MEMORY_BASIC_INFORMATION64()
         addr = 0
         limit = 0x7FFFFFFFFFFF  # user-mode space on x64
@@ -284,7 +298,13 @@ class WindowsProcess:
                 and not (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
                 and mbi.RegionSize > 0
             ):
-                regions.append((int(mbi.BaseAddress), int(mbi.RegionSize)))
+                regions.append(
+                    (
+                        int(mbi.BaseAddress),
+                        int(mbi.RegionSize),
+                        int(mbi.Protect),
+                    )
+                )
             nxt = mbi.BaseAddress + mbi.RegionSize
             if nxt <= addr:
                 break
@@ -293,10 +313,18 @@ class WindowsProcess:
         self._regions = regions
         return regions
 
+    def readable_regions(self) -> list[tuple[int, int]]:
+        return [(b, s) for b, s, _p in self._query_regions()]
+
+    def writable_regions(self) -> list[tuple[int, int]]:
+        return [
+            (b, s) for b, s, p in self._query_regions() if p & WRITABLE
+        ]
+
     def is_readable(self, addr: int) -> bool:
         import bisect
 
-        regions = self.readable_regions()
+        regions = [(b, s) for b, s, _p in self._query_regions()]
         bases = [b for b, _ in regions]
         i = bisect.bisect_right(bases, addr) - 1
         return i >= 0 and addr < regions[i][0] + regions[i][1]

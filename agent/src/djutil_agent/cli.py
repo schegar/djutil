@@ -448,14 +448,13 @@ def decks_scan(
     if save:
         from djutil_agent.rbmem.offsets import load_offsets
 
-        # don't clobber a master_index found by `decks master-scan`
+        # don't clobber master_index/fader found by interactive scans
         existing = load_offsets(version)
-        if (
-            offs.master_index is None
-            and existing is not None
-            and existing.master_index is not None
-        ):
-            offs.master_index = existing.master_index
+        if existing is not None:
+            if offs.master_index is None and existing.master_index is not None:
+                offs.master_index = existing.master_index
+            if offs.fader is None and existing.fader is not None:
+                offs.fader = existing.fader
         path = save_offsets(version, offs)
         typer.echo(f"\nSaved to {path}")
 
@@ -496,6 +495,36 @@ def decks_master_scan() -> None:
         typer.echo("Saved.")
 
 
+@decks_app.command("fader-scan")
+def decks_fader_scan(
+    channel: int = typer.Option(
+        ..., "--channel", "-c", min=1, max=4,
+        help="Mixer channel (1-based)",
+    ),
+) -> None:
+    """Interactively discover the channel-fader chain (move the fader when
+    prompted)."""
+    from djutil_agent.rbmem.fader import fader_scan, save_fader
+
+    proc = _open_rekordbox_process()
+    version = proc.version or _rekordbox_version() or "unknown"
+    typer.echo(
+        f"Rekordbox {version} (pid {proc.pid}, "
+        f"module @{proc.module_base:#x})"
+    )
+    result = fader_scan(proc, channel, echo=typer.echo)
+    if result.pointer is None or result.encoding is None:
+        raise typer.Exit(3)
+    typer.echo(
+        f"\nfader[{channel}] chain ({result.encoding}): "
+        f"{result.pointer.format()}"
+    )
+    if save_fader(
+        version, channel, result.pointer, result.encoding, echo=typer.echo
+    ):
+        typer.echo("Saved.")
+
+
 @decks_app.command("watch")
 def decks_watch(
     hz: float = typer.Option(5.0, "--hz", min=0.5, max=30),
@@ -503,14 +532,19 @@ def decks_watch(
         0.0, "--seconds", help="Stop after N seconds (0 = unlimited)"
     ),
 ) -> None:
-    """Print live deck state (title/BPM/position) until Ctrl+C."""
+    """Print live deck state (title/BPM/position/fader) until Ctrl+C."""
     import contextlib
 
-    from djutil_agent.rbmem.master import DeckSnap, pick_now_playing
+    from djutil_agent.rbmem.nowplaying import (
+        DeckSample,
+        NowPlayingTracker,
+        is_playing,
+    )
     from djutil_agent.rbmem.offsets import SAMPLE_RATE, load_offsets
     from djutil_agent.rbmem.pointer import (
         read_cstr,
         read_f32,
+        read_f64,
         read_i64,
         read_u8,
     )
@@ -533,17 +567,21 @@ def decks_watch(
         f"Watching {len(offs.anlz_path)} decks at {hz:g} Hz "
         f"(offsets for {version}). Ctrl+C to stop."
     )
-    if offs.master_index is None:
-        typer.echo("master index unknown - run `djutil-agent decks master-scan`")
-    prev: dict[int, tuple[str | None, float]] = {}
-    snaps: dict[int, DeckSnap] = {}
+    if offs.fader is None or all(f is None for f in offs.fader):
+        typer.echo(
+            "faders unknown - run `djutil-agent decks fader-scan "
+            "--channel N`"
+        )
+    prev: dict[int, tuple[str | None, int | None]] = {}
+    tracker = NowPlayingTracker()
     prev_line = ""
-    prev_np: tuple[int | None, str | None] = (None, None)
     t_start = time.monotonic()
     try:
         while True:
             now = time.monotonic()
+            wall_now = time.time()
             parts = []
+            samples: list[DeckSample] = []
             master = None
             if offs.master_index:
                 with contextlib.suppress(MemoryReadError):
@@ -568,54 +606,42 @@ def decks_watch(
                 if offs.position:
                     with contextlib.suppress(MemoryReadError):
                         pos = read_i64(proc, offs.position[d])
-                playing = (
-                    pos is not None
-                    and d in prev
-                    and prev[d][1] is not None
-                    and pos != prev[d][1]
-                )
-                prev[d] = (norm, pos or 0.0)
+                fader = None
+                if (
+                    offs.fader
+                    and d < len(offs.fader)
+                    and offs.fader[d] is not None
+                ):
+                    fp = offs.fader[d]
+                    assert fp is not None
+                    with contextlib.suppress(MemoryReadError):
+                        fader = (
+                            read_f32 if fp.encoding == "f32" else read_f64
+                        )(proc, fp.pointer)
                 cid = track.content_id if track else None
-                snap = snaps.get(d)
-                if snap is None:
-                    snap = DeckSnap(False, None, None, "")
-                if playing:
-                    if not snap.playing:
-                        snap.playing_since = now
-                    snap.playing = True
-                else:
-                    snap.playing = False
-                    snap.playing_since = None
-                snap.content_id = cid
-                snap.title = title or "?"
-                snaps[d] = snap
+                key = cid or norm
+                pkey, ppos = prev.get(d, (None, None))
+                playing = is_playing(pkey, ppos, key, pos)
+                prev[d] = (key, pos)
+                samples.append(
+                    DeckSample(cid or key, title or "?", playing, fader)
+                )
                 mark = "*" if master == d else " "
                 pos_s = f"{pos / SAMPLE_RATE:.2f}s" if pos is not None else "?"
+                fad_s = f"{fader:.2f}" if fader is not None else "?"
                 parts.append(
                     f"{mark}d{d} {'PLAY' if playing else '    '} "
                     f"{title} bpm={bpm if bpm is not None else '?'} "
-                    f"pos={pos_s} cid={cid or '-'}"
+                    f"pos={pos_s} fader={fad_s} cid={cid or '-'}"
                 )
             assert offs.anlz_path is not None
-            np_idx = pick_now_playing(
-                [
-                    snaps.get(d, DeckSnap(False, None, None, ""))
-                    for d in range(len(offs.anlz_path))
-                ],
-                master,
-                now,
-            )
-            np_state: tuple[int | None, str | None] = (None, None)
-            if np_idx is not None:
-                snap = snaps[np_idx]
-                np_state = (np_idx, snap.content_id)
-            if np_state != prev_np and np_state[0] is not None:
-                snap = snaps[np_state[0]]
+            ev = tracker.update(now, wall_now, samples)
+            if ev is not None:
                 typer.echo(
-                    f"{time.strftime('%H:%M:%S')} NOW PLAYING: {snap.title} "
-                    f"[{snap.content_id}] (deck {np_state[0]})"
+                    f"{time.strftime('%H:%M:%S')} NOW PLAYING: {ev.title} "
+                    f"[{ev.cid}] (deck {ev.deck}) since "
+                    f"{time.strftime('%H:%M:%S', time.localtime(ev.wall_since))}"
                 )
-            prev_np = np_state
             line = " | ".join(parts)
             if line and line != prev_line:
                 typer.echo(

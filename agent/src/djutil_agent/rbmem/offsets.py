@@ -46,6 +46,14 @@ def master_index_pointer(base: int) -> Pointer:
     return Pointer((base, 0x20, 0x278), 0x124)
 
 
+@dataclass(frozen=True)
+class FaderPointer:
+    """A channel-fader chain plus the float encoding of its value."""
+
+    pointer: Pointer
+    encoding: str  # "f32" | "f64"
+
+
 @dataclass
 class DeckOffsets:
     """Pointer chains for one Rekordbox version.
@@ -59,6 +67,7 @@ class DeckOffsets:
     bpm: list[Pointer] | None = None
     position: list[Pointer] | None = None
     master_index: Pointer | None = None
+    fader: list[FaderPointer | None] | None = None
 
     @classmethod
     def from_bases(
@@ -106,6 +115,18 @@ class DeckOffsets:
         out["master_index"] = (
             self.master_index.format() if self.master_index else None
         )
+        out["fader"] = (
+            [
+                (
+                    {"ptr": f.pointer.format(), "enc": f.encoding}
+                    if f is not None
+                    else None
+                )
+                for f in self.fader
+            ]
+            if self.fader
+            else None
+        )
         return out
 
     @classmethod
@@ -117,12 +138,26 @@ class DeckOffsets:
             return [Pointer.parse(str(p)) for p in raw]
 
         mi = data.get("master_index")
+        fader: list[FaderPointer | None] | None = None
+        raw_fader = data.get("fader")
+        if isinstance(raw_fader, list):
+            fader = [
+                (
+                    FaderPointer(
+                        Pointer.parse(str(e["ptr"])), str(e["enc"])
+                    )
+                    if isinstance(e, dict)
+                    else None
+                )
+                for e in raw_fader
+            ]
         return cls(
             anlz_path=lst("anlz_path"),
             track_info=lst("track_info"),
             bpm=lst("bpm"),
             position=lst("position"),
             master_index=Pointer.parse(str(mi)) if mi else None,
+            fader=fader,
         )
 
 
