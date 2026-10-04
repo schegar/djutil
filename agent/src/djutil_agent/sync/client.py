@@ -22,13 +22,18 @@ class SyncClient:
         max_retries: int = 3,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        self._base_url = base_url.rstrip("/")
         self._client = httpx.Client(
-            base_url=base_url.rstrip("/"),
+            base_url=self._base_url,
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
             transport=transport,
         )
         self.max_retries = max_retries
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
 
     def close(self) -> None:
         self._client.close()

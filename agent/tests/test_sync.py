@@ -1,6 +1,7 @@
 """SyncEngine against the real FastAPI app via httpx ASGI transport."""
 
 import hashlib
+import json
 
 import pytest
 from argon2 import PasswordHasher
@@ -129,6 +130,62 @@ def test_reconcile_removes_playlist(engine_sync, server_client, db_file):
         )
     stats = engine_sync.reconcile_ids()
     assert stats["playlists"] == 1
+
+
+@pytest.fixture()
+def no_usn_reader(db_file):
+    """Reader over a DB whose djmdCue.rb_local_usn is all NULL (RB7-style)."""
+    from djutil_agent.rekordbox.reader import RekordboxReader
+
+    eng = create_engine(f"sqlite:///{db_file}")
+    with eng.begin() as conn:
+        conn.execute(text("UPDATE djmdCue SET rb_local_usn=NULL"))
+    r = RekordboxReader(eng)
+    yield r
+    eng.dispose()
+
+
+def test_second_delta_skips_unchanged_cues(no_usn_reader, server_client,
+                                         tmp_path):
+    eng = SyncEngine(
+        no_usn_reader, server_client, state_file=tmp_path / "fps.json"
+    )
+    assert eng.run_delta()["cues"] == 3
+    assert eng.run_delta()["cues"] == 0  # fingerprint match -> skip
+
+
+def test_fingerprint_scoped_to_server(no_usn_reader, server_client,
+                                      server_url, tmp_path):
+    state_file = tmp_path / "fps.json"
+    eng = SyncEngine(no_usn_reader, server_client, state_file=state_file)
+    eng.run_delta()
+    # a different server base_url must not reuse the stored fingerprint
+    other = SyncClient(
+        server_url.replace("127.0.0.1", "localhost"), TOKEN, max_retries=0
+    )
+    try:
+        eng2 = SyncEngine(no_usn_reader, other, state_file=state_file)
+        assert eng2.run_delta()["cues"] == 3
+    finally:
+        other.close()
+
+
+def test_run_full_bypasses_fingerprint(no_usn_reader, server_client, tmp_path):
+    eng = SyncEngine(
+        no_usn_reader, server_client, state_file=tmp_path / "fps.json"
+    )
+    eng.run_full()
+    # second full re-sends no-usn entities even though the fingerprint matches
+    assert eng.run_full()["cues"] == 3
+
+
+def test_legacy_flat_state_file(no_usn_reader, server_client, tmp_path):
+    state_file = tmp_path / "fps.json"
+    state_file.write_text(json.dumps({"cues": "deadbeef"}))  # old format
+    eng = SyncEngine(no_usn_reader, server_client, state_file=state_file)
+    assert eng.run_delta()["cues"] == 3  # treated as empty -> send
+    data = json.loads(state_file.read_text())
+    assert isinstance(data.get(server_client.base_url), dict)
 
 
 def test_artwork_uploaded_once(engine_sync, server_client, tmp_path):

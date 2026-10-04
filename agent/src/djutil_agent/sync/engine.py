@@ -30,21 +30,31 @@ class SyncEngine:
         self.share_dir = share_dir
         self.state_file = state_file
         self._known_artwork: set[str] = set()
-        self._fps: dict[str, str] | None = None
+        self._fps: dict[str, dict[str, str]] | None = None
 
     # -- change fingerprint for entities without a usable usn ---------------
 
     def _load_fps(self) -> dict[str, str]:
+        """Fingerprint map for the current server.
+
+        Fingerprints are per-server ({server: {entity: fp}}) so pointing the
+        agent at a fresh server never suppresses the first send.
+        """
         if self._fps is None:
             import json
 
             self._fps = {}
             if self.state_file is not None and self.state_file.exists():
                 try:
-                    self._fps = json.loads(self.state_file.read_text())
+                    raw = json.loads(self.state_file.read_text())
                 except (OSError, ValueError):
-                    self._fps = {}
-        return self._fps
+                    raw = {}
+                if isinstance(raw, dict):
+                    # Legacy flat format {entity: fp} counts as empty.
+                    self._fps = {
+                        k: v for k, v in raw.items() if isinstance(v, dict)
+                    }
+        return self._fps.setdefault(self.client.base_url, {})
 
     def _save_fps(self) -> None:
         if self.state_file is None or self._fps is None:
@@ -95,8 +105,12 @@ class SyncEngine:
 
     # -- sync passes --------------------------------------------------------
 
-    def run_delta(self) -> dict[str, int]:
-        """One delta pass over all entities. Returns per-entity sent counts."""
+    def run_delta(self, force: bool = False) -> dict[str, int]:
+        """One delta pass over all entities. Returns per-entity sent counts.
+
+        ``force`` bypasses the no-usn fingerprint skip so a full sync always
+        re-sends entities that cannot be diffed by usn.
+        """
         state = self.client.get_state()
         stats: dict[str, int] = {}
         for entity in ENTITIES:
@@ -117,7 +131,7 @@ class SyncEngine:
                 ids = self.reader.ids(entity)
                 fp = self._fingerprint(upserts, ids)
                 fps = self._load_fps()
-                if fps.get(entity) == fp:
+                if not force and fps.get(entity) == fp:
                     stats[entity] = 0
                     continue
                 for i in range(0, len(upserts), BATCH_SIZE):
@@ -191,7 +205,7 @@ class SyncEngine:
 
     def run_full(self) -> dict[str, int]:
         """Delta from scratch (server state empty) + id-set reconcile."""
-        stats = self.run_delta()
+        stats = self.run_delta(force=True)
         pruned = self.reconcile_ids()
         for k, v in pruned.items():
             stats[k] = stats.get(k, 0) + v
