@@ -606,6 +606,51 @@ def _plant_fader(mem: FakeMemory, enc: str) -> int:
     return addr
 
 
+def test_fader_filter_searchsorted_keeps_right_ones():
+    """_filter reads only chunks holding candidates; keeps exactly the
+    matching ones across regions/chunks; drops unreadable ones."""
+    from djutil_agent.rbmem.fader import _filter
+
+    mem = _fader_mem()
+    # candidates spread over both regions and several chunks
+    a_mod = mem.module_base + 0x100
+    a_mod2 = mem.module_base + 0x3000
+    a_heap = mem.alloc(0x20) + 0x10
+    a_heap2 = mem.alloc(0x40) + 0x20
+    mem.alloc(0x2000)  # push a_gone into its own 0x2000 chunk
+    a_gone = mem.alloc(0x10)  # will live in an unreadable chunk
+    for a in (a_mod, a_mod2, a_heap, a_heap2, a_gone):
+        mem.write_f32(a, 0.0)
+    mem.write_f32(a_mod, 1.0)
+    mem.write_f32(a_heap2, 1.0)
+
+    # make the chunk containing a_gone unreadable
+    bad_lo = a_gone - (a_gone % 0x2000)
+    orig_read = mem.read
+
+    def flaky(addr: int, size: int) -> bytes:
+        if bad_lo <= addr < bad_lo + 0x2000:
+            raise MemoryReadError("gone")
+        return orig_read(addr, size)
+
+    mem.read = flaky  # type: ignore[method-assign]
+
+    import numpy as np
+
+    cands = np.array(
+        [a_mod, a_mod2, a_heap, a_heap2, a_gone], dtype=np.int64
+    )
+    kept = _filter(
+        mem, "f32", cands, "up", {}, chunk=0x2000, max_region=1 << 20
+    )
+    assert sorted(int(x) for x in kept) == sorted([a_mod, a_heap2])
+    # "down" keeps the zeros that are still readable
+    kept = _filter(
+        mem, "f32", cands, "down", {}, chunk=0x2000, max_region=1 << 20
+    )
+    assert sorted(int(x) for x in kept) == sorted([a_mod2, a_heap])
+
+
 def test_fader_scan_f32(tmp_path):
     from djutil_agent.rbmem.fader import fader_scan, save_fader
 

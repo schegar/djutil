@@ -97,41 +97,66 @@ def _filter(
     chunk: int,
     max_region: int,
 ) -> Any:
-    """Keep candidate addresses whose current float matches ``kind``."""
+    """Keep candidate addresses whose current float matches ``kind``.
+
+    Candidates are a sorted int64 array; for each writable chunk a
+    ``searchsorted`` slice selects the candidates inside it and chunks
+    without candidates are never read (candidates in an unreadable chunk
+    are dropped).
+    """
     import numpy as np
 
     if not len(cands):
         return cands
     align = 4 if enc == "f32" else 8
-    wanted = np.asarray(cands, dtype=np.int64)
+    dt = np.dtype("<f4") if enc == "f32" else np.dtype("<f8")
+    wanted = np.sort(np.asarray(cands, dtype=np.int64))
     keep: list[Any] = []
-    for base, data in _iter_writable(reader, chunk, max_region):
-        start, arr = _float_view(base, data, enc)
-        if not arr.size:
+    for base, size in sorted(reader.writable_regions()):
+        if size <= 0 or size > max_region:
             continue
-        addrs = start + np.arange(arr.size, dtype=np.int64) * align
-        mask = np.isin(addrs, wanted)
-        idx = np.nonzero(mask)[0]
-        if not idx.size:
-            continue
-        a = addrs[idx]
-        v = arr[idx].astype(np.float64)
-        if kind == "up":
-            ok = v == 1.0
-        elif kind == "down":
-            ok = v == 0.0
-        elif kind == "half":
-            ok = (v > 0.15) & (v < 0.85)
-        else:  # quarter
-            hv = np.array(
-                [half.get(int(x), 1.0) for x in a], dtype=np.float64
-            )
-            ok = (v > 0.02) & (v < hv)
-        good = a[ok]
-        if kind == "half":
-            for x, val in zip(a[ok], v[ok], strict=True):
-                half[int(x)] = float(val)
-        keep.append(good)
+        pos = 0
+        while pos < size:
+            n = min(chunk, size - pos)
+            lo = int(np.searchsorted(wanted, base + pos))
+            hi = int(np.searchsorted(wanted, base + pos + n))
+            if lo < hi:
+                try:
+                    data = reader.read(base + pos, n)
+                except MemoryReadError:
+                    pos += n
+                    continue
+                pad = (-(base + pos)) % align
+                m = (len(data) - pad) // align
+                if m > 0:
+                    arr = np.frombuffer(
+                        memoryview(data)[pad : pad + m * align], dtype=dt
+                    )
+                    c = wanted[lo:hi]
+                    rel = c - (base + pos + pad)
+                    idx = rel // align
+                    valid = (rel >= 0) & (rel % align == 0) & (idx < m)
+                    c, idx = c[valid], idx[valid]
+                    if len(c):
+                        v = arr[idx]
+                        if kind == "up":
+                            ok = v == 1.0
+                        elif kind == "down":
+                            ok = v == 0.0
+                        elif kind == "half":
+                            ok = (v > 0.15) & (v < 0.85)
+                        else:  # quarter
+                            hv = np.array(
+                                [half.get(int(x), 1.0) for x in c],
+                                dtype=np.float64,
+                            )
+                            ok = (v > 0.02) & (v < hv)
+                        good = c[ok]
+                        if kind == "half":
+                            for x, val in zip(good, v[ok], strict=True):
+                                half[int(x)] = float(val)
+                        keep.append(good)
+            pos += n
     return np.concatenate(keep) if keep else np.empty(0, dtype=np.int64)
 
 
@@ -173,15 +198,19 @@ def fader_scan(
     for i, (label, kind) in enumerate(PROMPTS):
         prompt(label.format(n=channel) + " ")
         done = i + 1
+        parts = []
         for enc in ENCODINGS:
+            if len(cands[enc]):
+                echo(f"  filtering {len(cands[enc])} {enc} candidates ...")
+            t = time.monotonic()
             cands[enc] = _filter(
                 reader, enc, cands[enc], kind, half,
                 chunk=chunk, max_region=max_region,
             )
-        echo(
-            "  -> survivors: "
-            + ", ".join(f"{enc}={len(c)}" for enc, c in cands.items())
-        )
+            parts.append(
+                f"{enc}={len(cands[enc])} ({time.monotonic() - t:.1f}s)"
+            )
+        echo("  -> survivors: " + ", ".join(parts))
         if all(len(c) == 0 for c in cands.values()):
             echo("  normalized-float hypothesis failed")
             return FaderResult(None, None, [])
