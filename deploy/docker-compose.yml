@@ -2,7 +2,7 @@ services:
   app:
     # Pull the release image by default; `build:` stays as a fallback for
     # local builds (`docker compose build` / `--build`).
-    image: ${DJUTIL_IMAGE:-ghcr.io/patwi/djutil:latest}
+    image: ${DJUTIL_IMAGE:-ghcr.io/schegar/djutil:latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -15,7 +15,7 @@ services:
     # Nightly SQLite online backup into ./backups (keeps newest 14).
     # The data volume is mounted read-only; artwork is not backed up —
     # the agent re-uploads it after a restore.
-    image: ${DJUTIL_IMAGE:-ghcr.io/patwi/djutil:latest}
+    image: ${DJUTIL_IMAGE:-ghcr.io/schegar/djutil:latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
