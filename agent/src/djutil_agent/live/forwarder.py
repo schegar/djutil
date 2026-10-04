@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _WS_FAIL_REST_THRESHOLD = 3
 _MAX_BACKOFF = 30.0
+_HEARTBEAT_IDLE = 15.0  # send a heartbeat after this many idle seconds
 
 
 def _ws_url(server_url: str) -> str:
@@ -46,6 +47,7 @@ class LiveForwarder:
         self.status = status
         self._ws_failures = 0
         self._stop = asyncio.Event()
+        self._new = asyncio.Event()  # set when the outbox gains an event
         self._loop: asyncio.AbstractEventLoop | None = None
 
     async def _hello(self) -> str:
@@ -58,22 +60,51 @@ class LiveForwarder:
             }
         )
 
-    async def _send_pending_ws(self, ws: ClientConnection) -> None:
-        await ws.send(await self._hello())
+    async def _flush(self, ws: ClientConnection) -> None:
+        """Send pending outbox events in order, awaiting each matching ack.
+
+        Acks are read inline here — nothing else may recv on this socket
+        while a flush is running.
+        """
         for event in self.outbox.pending():
             await ws.send(
                 json.dumps({"type": "play", "event": json.loads(event.model_dump_json())})
             )
             try:
-                reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                while True:
+                    reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                    if (
+                        reply.get("type") == "ack"
+                        and reply.get("history_entry_id") == event.history_entry_id
+                    ):
+                        self.outbox.ack(event.history_entry_id)
+                        break
+                    # non-ack message (e.g. server push): skip it
             except TimeoutError:
                 logger.warning("ack timeout for %s", event.history_entry_id)
                 raise ConnectionError("ack timeout") from None
-            if (
-                reply.get("type") == "ack"
-                and reply.get("history_entry_id") == event.history_entry_id
-            ):
-                self.outbox.ack(event.history_entry_id)
+
+    async def _connected(self, ws: ClientConnection) -> None:
+        """Post-connect phase: hello, flush, then idle/heartbeat/send loop."""
+        await ws.send(await self._hello())
+        await self._flush(ws)
+        while not self._stop.is_set():
+            new_task = asyncio.create_task(self._new.wait())
+            stop_task = asyncio.create_task(self._stop.wait())
+            done, pending = await asyncio.wait(
+                {new_task, stop_task},
+                timeout=_HEARTBEAT_IDLE,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            if stop_task in done:
+                break
+            if not done:  # idle timeout
+                await ws.send(json.dumps({"type": "heartbeat"}))
+                continue
+            self._new.clear()
+            await self._flush(ws)
 
     async def _flush_rest(self) -> None:
         import httpx
@@ -108,12 +139,9 @@ class LiveForwarder:
                     ping_interval=20,
                 ) as ws:
                     self._set_conn("connected")
-                    await self._send_pending_ws(ws)
                     self._ws_failures = 0
                     backoff = 1.0
-                    # stay connected; poll for new plays is handled by caller
-                    async for _raw in ws:
-                        pass
+                    await self._connected(ws)
             except Exception as exc:
                 self._set_conn("disconnected")
                 self._ws_failures += 1
@@ -131,6 +159,7 @@ class LiveForwarder:
         while not self._stop.is_set():
             for event in self.watcher.poll():
                 self.outbox.put(event)
+                self._new.set()  # wake the connected loop to flush
                 if self.status is not None:
                     t = event.track
                     label = (

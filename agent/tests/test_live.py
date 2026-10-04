@@ -139,10 +139,49 @@ def test_resend_unacked_in_order(tmp_path):
     f.outbox.put(ev(1))
     f.outbox.put(ev(2))
     ws = FakeWS()
-    asyncio.run(f._send_pending_ws(ws))  # type: ignore[arg-type]
+    asyncio.run(f._flush(ws))  # type: ignore[arg-type]
     types = [json.loads(m)["type"] for m in ws.sent]
-    assert types == ["hello", "play", "play"]
+    assert types == ["play", "play"]
     assert f.outbox.pending() == []  # all acked
+
+
+def test_flush_skips_non_ack_messages(tmp_path):
+    """While awaiting a matching ack, other server messages are ignored."""
+    f = make_forwarder(tmp_path)
+    f.outbox.put(ev(1))
+    ws = FakeWS()
+
+    orig_send = ws.send
+
+    async def send(msg: str) -> None:
+        # interleave a non-ack message BEFORE the real ack
+        ws._acks.put_nowait(json.dumps({"type": "pong"}))
+        await orig_send(msg)
+
+    ws.send = send  # type: ignore[method-assign]
+    asyncio.run(f._flush(ws))  # type: ignore[arg-type]
+    assert f.outbox.pending() == []
+
+
+def test_heartbeat_on_idle(tmp_path, monkeypatch):
+    """The connected loop sends a heartbeat after the idle timeout."""
+    import djutil_agent.live.forwarder as fwd
+
+    monkeypatch.setattr(fwd, "_HEARTBEAT_IDLE", 0.05)
+    f = make_forwarder(tmp_path)
+    ws = FakeWS()
+
+    async def go():
+        task = asyncio.create_task(f._connected(ws))  # type: ignore[arg-type]
+        await asyncio.sleep(0.3)
+        f.stop()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
+    types = [json.loads(m)["type"] for m in ws.sent]
+    assert types[0] == "hello"
+    assert "heartbeat" in types
 
 
 # -- end-to-end: real uvicorn + real ws -----------------------------------
@@ -205,3 +244,81 @@ def test_forwarder_end_to_end(tmp_path, live_server):
     assert len(s["session"]) == 1
     assert s["session"][0]["played_at"]
     assert s["agent"]["connected"] is True or s["agent"]["hostname"]
+
+
+class DelayedWatcher:
+    """Returns events only after `delay` seconds — i.e. after the WS is up."""
+
+    def __init__(self, delay: float, events: list[PlayEvent]) -> None:
+        self.delay = delay
+        self.events = events
+        self._t0 = time.monotonic()
+
+    def prime(self) -> None:
+        pass
+
+    def poll(self) -> list[PlayEvent]:
+        if time.monotonic() - self._t0 < self.delay:
+            return []
+        out, self.events = self.events, []
+        return out
+
+
+def test_forwarder_delivers_event_arriving_after_connect(tmp_path, live_server):
+    """Regression: an event landing in the outbox while the WS is already
+    connected must still be sent (previously only flushed on reconnect)."""
+    watcher = DelayedWatcher(delay=2.0, events=[ev(1)])
+    f = LiveForwarder(
+        watcher,  # type: ignore[arg-type]
+        Outbox(tmp_path / "outbox.db"),
+        live_server,
+        "e2e-token",
+        rb_version="7.0",
+    )
+
+    async def go():
+        task = asyncio.create_task(f.run())
+        # 2 s watcher delay + poll cadence + ws round trip must fit in 8 s
+        await asyncio.sleep(8)
+        f.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    asyncio.run(asyncio.wait_for(go(), timeout=15))
+    assert f.outbox.pending() == []  # event was sent and acked
+
+    r = httpx.post(f"{live_server}/api/auth/login", json={"password": "e2epw"})
+    s = httpx.get(f"{live_server}/api/live/state", cookies=r.cookies).json()
+    assert len(s["session"]) == 1
+
+
+def test_forwarder_delivers_second_event_without_reconnect(tmp_path, live_server):
+    """A second play later still goes out over the same connection."""
+    watcher = DelayedWatcher(delay=2.0, events=[ev(1)])
+    f = LiveForwarder(
+        watcher,  # type: ignore[arg-type]
+        Outbox(tmp_path / "outbox.db"),
+        live_server,
+        "e2e-token",
+        rb_version="7.0",
+    )
+
+    async def go():
+        task = asyncio.create_task(f.run())
+        await asyncio.sleep(6)
+        assert f.outbox.pending() == []  # first event already flushed
+        f.outbox.put(ev(2))
+        f._new.set()
+        await asyncio.sleep(3)
+        f.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    asyncio.run(asyncio.wait_for(go(), timeout=15))
+    assert f.outbox.pending() == []
+
+    r = httpx.post(f"{live_server}/api/auth/login", json={"password": "e2epw"})
+    s = httpx.get(f"{live_server}/api/live/state", cookies=r.cookies).json()
+    assert len(s["session"]) == 2
