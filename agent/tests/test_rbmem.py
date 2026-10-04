@@ -215,7 +215,7 @@ def test_offsets_builtin_fallback(tmp_path):
 def _db_tracks() -> tuple[dict[str, DbTrack], list[str]]:
     paths = [
         "PIONEER/USBANLZ/A/1/ANLZ0000.DAT",
-        "PIONEER/USBANLZ/B/2/ANLZ0001.DAT",
+        "PIONEER/USBANLZ/B/2/ANLZ0000.DAT",
     ]
     db = {
         paths[0]: DbTrack("c1", "Song One", 128.0),
@@ -258,7 +258,7 @@ def _plant_info_and_master(
         chain = (first, a, b)
     _, _, b = chain
     c = mem.alloc(0x300)
-    mem.write_u64(b + 80 + 8 * deck, c)
+    mem.write_u64(b + 0x80 + 8 * deck, c)
     d = mem.alloc(0x200)
     mem.write_u64(c + 0x168, d)
     s = mem.alloc(256)
@@ -291,7 +291,7 @@ def test_scan_finds_shifted_bases():
     decks_base = BASE_722_DECKS + 0x888
     anlz_first = info_chain = decks_first = None
     for d, (suffix, track) in enumerate(
-        zip(("PIONEER/USBANLZ/A/1/ANLZ0000.DAT", "PIONEER/USBANLZ/B/2/ANLZ0001.DAT"),
+        zip(("PIONEER/USBANLZ/A/1/ANLZ0000.DAT", "PIONEER/USBANLZ/B/2/ANLZ0000.DAT"),
             db.values(), strict=True)
     ):
         anlz_first = _plant_anlz(mem, anlz_base, d, suffix, anlz_first)
@@ -336,3 +336,123 @@ def test_scan_no_decks_reports():
     assert res.anlz_base is None
     assert res.offsets() is None
     assert res.candidates["anlz"] == 0
+
+
+# -- probe -----------------------------------------------------------------------
+
+
+def _probe_mem() -> FakeMemory:
+    """Small fake address space for probe tests."""
+    return FakeMemory(base=MODULE_BASE, size=0x40000)
+
+
+def test_probe_finds_utf8_and_utf16_strings():
+    from djutil_agent.rbmem.probe import find_anlz_strings
+
+    mem = _probe_mem()
+    db, _ = _db_tracks()
+    s1 = mem.alloc(600)
+    mem.write(s1, b"title\x00D:\\rb\\PIONEER\\USBANLZ\\A\\1\\ANLZ0000.DAT\x00")
+    s2 = mem.alloc(1200)
+    mem.write(
+        s2,
+        b"\x00\x00"
+        + "PIONEER/USBANLZ/B/2/ANLZ0000.EXT".encode("utf-16-le")
+        + b"\x00\x00",
+    )
+    # find string starts, not the pattern start: plant the utf8 path offset
+    str8 = s1 + len(b"title\x00")
+    hits = find_anlz_strings(mem, db)
+    by_enc = {h.enc: h for h in hits}
+    assert set(by_enc) == {"utf-8", "utf-16le"}
+    assert by_enc["utf-8"].addr == str8
+    assert by_enc["utf-8"].track is not None
+    assert by_enc["utf-8"].track.content_id == "c1"
+    # .EXT normalizes to .DAT for matching
+    assert by_enc["utf-16le"].track is not None
+    assert by_enc["utf-16le"].track.content_id == "c2"
+
+
+def test_probe_reverse_walk_recovers_chain():
+    from djutil_agent.rbmem.probe import (
+        find_value_holders,
+        reverse_walk,
+    )
+
+    mem = _probe_mem()
+    db, _ = _db_tracks()
+    track = db["PIONEER/USBANLZ/A/1/ANLZ0000.DAT"]
+    # non-7.2.2 chain: module+0x2000 -> SA --(+0x40)--> SB --(+0x88)--> string
+    sa = mem.alloc(0x100)
+    mem.alloc(0x2000)  # gap so sa isn't a parent of the holder itself
+    sb = mem.alloc(0x100)
+    s = mem.alloc(200)
+    mem.write_str(s, "D:\\rb\\PIONEER\\USBANLZ\\A\\1\\ANLZ0000.DAT")
+    mem.write_u64(mem.module_base + 0x2000, sa)
+    mem.write_u64(sa + 0x40, sb)
+    mem.write_u64(sb + 0x88, s)  # holder of S
+
+    holders = find_value_holders(mem, {s})
+    assert holders[s] == [sb + 0x88]
+    chains = reverse_walk(
+        mem,
+        {sb + 0x88: (track, [])},
+        echo=lambda _m: None,
+        chunk=1 << 16,
+    )
+    assert len(chains) == 1
+    c = chains[0]
+    assert c.module_off == 0x2000
+    assert c.inners == [0x40, 0x88]
+    assert c.text() == "2000 40 88 0"
+    assert c.content_id == "c1"
+
+
+def test_probe_seed_selection_absolute_only():
+    from djutil_agent.rbmem.probe import Hit, select_seeds
+    from djutil_agent.rbmem.scan import DbTrack
+
+    t = DbTrack("c1", "Song One", 128.0)
+    hits = [
+        Hit(1, "C:/u/share/PIONEER/USBANLZ/A/1/ANLZ0000.DAT", "utf-8", t),
+        Hit(2, "/PIONEER/USBANLZ/A/1/ANLZ0000.DAT", "utf-8", t),
+        Hit(3, "C:/u/share/PIONEER/USBANLZ/X/9/ANLZ0000.DAT", "utf-8", None),
+    ]
+    seeds = select_seeds(hits, absolute_only=True)
+    assert [h.addr for h in seeds] == [1]  # absolute + DB-matched only
+    # no flag -> all DB-matched strings seed
+    assert [h.addr for h in select_seeds(hits)] == [1, 2]
+    # track filter matches title substring, case-insensitive
+    assert [h.addr for h in select_seeds(hits, track_filters=("SONG",))] == [1, 2]
+    assert select_seeds(hits, track_filters=("zzz",)) == []
+
+
+def test_probe_validate_finds_deck_variant():
+    from djutil_agent.rbmem.probe import Chain, validate_chains
+
+    mem = _probe_mem()
+    db, _ = _db_tracks()
+    # deck array: module+0x3000 -> first; first+8 -> deck1; first+0x10 -> deck2
+    first = mem.alloc(0x100)
+    mem.write_u64(mem.module_base + 0x3000, first)
+    strs = {}
+    for deck, suffix in (
+        (0x8, "PIONEER/USBANLZ/A/1/ANLZ0000.DAT"),
+        (0x10, "PIONEER/USBANLZ/B/2/ANLZ0000.DAT"),
+    ):
+        d = mem.alloc(0x200)
+        mem.write_u64(first + deck, d)
+        s = mem.alloc(0x100)
+        mem.write_u64(d + 0xA0, s)
+        strp = mem.alloc(200)
+        mem.write_u64(s + 0xDD0, strp)
+        mem.write_str(strp, f"D:\\rb\\{suffix}")
+        strs[deck] = strp
+    c = Chain(module_off=0x3000, inners=[0x8, 0xA0, 0xDD0],
+              content_id="c1", title="Song One")
+    out: list[str] = []
+    validate_chains(mem, db, [c], echo=out.append)
+    joined = "\n".join(out)
+    assert "Song One" in joined          # the chain resolves
+    assert "Song Two" in joined          # +8 on level 1 reveals deck 2
+    assert "0x8+0x8" in joined

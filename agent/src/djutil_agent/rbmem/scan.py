@@ -46,10 +46,23 @@ def norm_anlz_path(path: str) -> str | None:
 
     Handles ``D:\\...\\PIONEER\\USBANLZ\\x\\u\\ANLZ0000.DAT`` (memory) and
     ``/PIONEER/USBANLZ/x/u/ANLZ0000.DAT`` (djmdContent.AnalysisDataPath).
+    Uses the LAST ``PIONEER`` occurrence - the share dir itself lives under
+    ``.../Roaming/Pioneer/rekordbox/share/PIONEER/USBANLZ/...``.
     """
     s = path.replace("\\", "/").upper()
-    i = s.find("PIONEER")
+    i = s.rfind("PIONEER")
     return s[i:] if i >= 0 else None
+
+
+def is_absolute_path(text: str) -> bool:
+    """True if the path has a drive-letter or root prefix before PIONEER,
+    e.g. ``C:/Users/.../share/PIONEER/...`` vs the relative ``/PIONEER/...``."""
+    up = text.upper()
+    i = up.rfind("PIONEER")
+    if i < 0:
+        return False
+    prefix = text[:i]
+    return ":/" in prefix or ":\\" in prefix
 
 
 def build_db_map(

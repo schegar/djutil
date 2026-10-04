@@ -38,7 +38,7 @@ def position_pointer(base: int, deck: int) -> Pointer:
 
 
 def track_info_pointer(base: int, deck: int) -> Pointer:
-    return Pointer((base, 0x20, 0x410, 80 + 8 * deck, 0x168, 0xF0), 0)
+    return Pointer((base, 0x20, 0x410, 0x80 + 8 * deck, 0x168, 0xF0), 0)
 
 
 def master_index_pointer(base: int) -> Pointer:

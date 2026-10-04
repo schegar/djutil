@@ -537,5 +537,61 @@ def decks_watch(
         typer.echo("\nStopped.")
 
 
+@decks_app.command("probe")
+def decks_probe(
+    track: list[str] | None = typer.Option(
+        None, "--track", help="Seed only tracks matching this content id or "
+        "title substring (repeatable)"
+    ),
+    absolute_only: bool = typer.Option(
+        False, "--absolute-only", help="Seed only absolute (C:/...) paths"
+    ),
+    diff: bool = typer.Option(
+        False, "--diff", help="Snapshot, prompt to load a new track, "
+        "seed only new/changed strings"
+    ),
+    frontier: int = typer.Option(2000, "--frontier"),
+    depth: int = typer.Option(4, "--depth"),
+    out: Path | None = typer.Option(
+        None, "--out", help="Also write the report to this file"
+    ),
+) -> None:
+    """Diagnostic: find ANLZ strings in memory and walk pointers back to the
+    module (used when `decks scan` finds nothing)."""
+    from djutil_agent.rbmem.probe import run
+
+    proc = _open_rekordbox_process()
+    typer.echo(
+        f"Rekordbox {proc.version or _rekordbox_version() or '?'} "
+        f"(pid {proc.pid}, module @{proc.module_base:#x}, "
+        f"{proc.module_size / 1e6:.0f} MB)"
+    )
+    db = _deck_db_map()
+    typer.echo(f"{len(db)} tracks with analysis paths in master.db")
+
+    fh = out.open("w", encoding="utf-8") if out is not None else None
+
+    def echo(msg: str) -> None:
+        typer.echo(msg)
+        if fh is not None:
+            fh.write(msg + "\n")
+            fh.flush()
+
+    try:
+        run(
+            proc,
+            db,
+            echo=echo,
+            depth=depth,
+            cap=frontier,
+            absolute_only=absolute_only,
+            track_filters=tuple(track or ()),
+            diff=diff,
+        )
+    finally:
+        if fh is not None:
+            fh.close()
+
+
 if __name__ == "__main__":
     sys.exit(app())
