@@ -513,16 +513,88 @@ def decks_fader_scan(
         f"module @{proc.module_base:#x})"
     )
     result = fader_scan(proc, channel, echo=typer.echo)
-    if result.pointer is None or result.encoding is None:
+    if not result.pointers or result.encoding is None:
         raise typer.Exit(3)
-    typer.echo(
-        f"\nfader[{channel}] chain ({result.encoding}): "
-        f"{result.pointer.format()}"
-    )
+    typer.echo(f"\nfader[{channel}] chains ({result.encoding}):")
+    for p in result.pointers:
+        typer.echo(f"  {p.format()}")
     if save_fader(
-        version, channel, result.pointer, result.encoding, echo=typer.echo
+        version, channel, result.pointers, result.encoding,
+        echo=typer.echo,
     ):
         typer.echo("Saved.")
+
+
+@decks_app.command("check")
+def decks_check() -> None:
+    """Resolve every saved chain once and print OK/ERR + value."""
+    from djutil_agent.rbmem.fader import read_fader
+    from djutil_agent.rbmem.offsets import SAMPLE_RATE, load_offsets
+    from djutil_agent.rbmem.pointer import (
+        read_cstr,
+        read_f32,
+        read_i64,
+        read_u8,
+    )
+    from djutil_agent.rbmem.process import MemoryReadError
+
+    proc = _open_rekordbox_process()
+    version = proc.version or _rekordbox_version() or ""
+    offs = load_offsets(version)
+    if offs is None:
+        typer.secho(
+            f"No saved offsets for Rekordbox {version or 'unknown'}",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(2)
+    typer.echo(f"Rekordbox {version} (pid {proc.pid})")
+
+    def line(name: str, ok: bool, val: object) -> None:
+        typer.echo(f"  {name:<22} {'OK ' if ok else 'ERR'} {val}")
+
+    for name in ("anlz_path", "track_info"):
+        ptrs = getattr(offs, name) or []
+        for d, p in enumerate(ptrs):
+            try:
+                v = read_cstr(proc, p, 200)
+            except MemoryReadError as e:
+                line(f"{name}[{d}]", False, e)
+            else:
+                line(f"{name}[{d}]", True, v.split("\n")[0][:60])
+    for name in ("bpm", "position"):
+        ptrs = getattr(offs, name) or []
+        for d, p in enumerate(ptrs):
+            try:
+                if name == "bpm":
+                    line(f"bpm[{d}]", True, read_f32(proc, p))
+                else:
+                    line(
+                        f"position[{d}]", True,
+                        f"{read_i64(proc, p) / SAMPLE_RATE:.2f}s",
+                    )
+            except MemoryReadError as e:
+                line(f"{name}[{d}]", False, e)
+    if offs.master_index:
+        try:
+            line("master_index", True, read_u8(proc, offs.master_index))
+        except MemoryReadError as e:
+            line("master_index", False, e)
+    for d, entry in enumerate(offs.fader or []):
+        if entry is None:
+            continue
+        fv = read_fader(proc, entry)
+        for j, p in enumerate(entry.chains):
+            try:
+                addr = p.resolve(proc)
+            except MemoryReadError:
+                line(f"fader[{d}] alt{j}", False, "resolve failed")
+            else:
+                line(f"fader[{d}] alt{j}", True, f"@{addr:#x}")
+        line(
+            f"fader[{d}] ({entry.encoding})",
+            fv is not None,
+            f"{fv:.3f}" if fv is not None else "no working chain",
+        )
 
 
 @decks_app.command("watch")
@@ -535,6 +607,7 @@ def decks_watch(
     """Print live deck state (title/BPM/position/fader) until Ctrl+C."""
     import contextlib
 
+    from djutil_agent.rbmem.fader import read_fader
     from djutil_agent.rbmem.nowplaying import (
         DeckSample,
         NowPlayingTracker,
@@ -544,7 +617,6 @@ def decks_watch(
     from djutil_agent.rbmem.pointer import (
         read_cstr,
         read_f32,
-        read_f64,
         read_i64,
         read_u8,
     )
@@ -614,10 +686,7 @@ def decks_watch(
                 ):
                     fp = offs.fader[d]
                     assert fp is not None
-                    with contextlib.suppress(MemoryReadError):
-                        fader = (
-                            read_f32 if fp.encoding == "f32" else read_f64
-                        )(proc, fp.pointer)
+                    fader = read_fader(proc, fp)
                 cid = track.content_id if track else None
                 key = cid or norm
                 pkey, ppos = prev.get(d, (None, None))

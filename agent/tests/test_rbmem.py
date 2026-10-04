@@ -671,25 +671,25 @@ def test_fader_scan_f32(tmp_path):
         mem, 1, prompt=fake_input, echo=lambda _m: None, chunk=1 << 16
     )
     assert res.encoding == "f32"
-    assert res.pointer == Pointer((0x2100, 0x40), 0x88)
-    assert res.pointer.resolve(mem) == fader_addr
+    assert res.pointers[0] == Pointer((0x2100, 0x40), 0x88)
+    assert res.pointers[0].resolve(mem) == fader_addr
 
     # save merges into an existing entry without clobbering other fields
     offs = DeckOffsets.from_bases(anlz_base=0x588CB08)
     path = tmp_path / "rbmem_offsets.json"
     save_offsets("7.2.10", offs, path)
     assert save_fader(
-        "7.2.10", 1, res.pointer, "f32", path, echo=lambda _m: None
+        "7.2.10", 1, res.pointers, "f32", path, echo=lambda _m: None
     )
     got = load_offsets("7.2.10", path)
     assert got is not None and got.fader is not None
     assert got.fader[0] is not None
-    assert got.fader[0].pointer == res.pointer
+    assert got.fader[0].chains[0] == res.pointers[0]
     assert got.fader[0].encoding == "f32"
     assert got.anlz_path == offs.anlz_path
     # refused without a saved entry
     assert not save_fader(
-        "9.9.9", 1, res.pointer, "f32", path, echo=lambda _m: None
+        "9.9.9", 1, res.pointers, "f32", path, echo=lambda _m: None
     )
 
 
@@ -711,7 +711,74 @@ def test_fader_scan_f64():
         mem, 2, prompt=fake_input, echo=lambda _m: None, chunk=1 << 16
     )
     assert res.encoding == "f64"
-    assert res.pointer == Pointer((0x2100, 0x40), 0x88)
+    assert res.pointers[0] == Pointer((0x2100, 0x40), 0x88)
+
+
+def test_fader_scan_tolerates_inexact_ends():
+    """Fader resting at 0.998 / 0.003 still counts as up/down."""
+    from djutil_agent.rbmem.fader import fader_scan
+
+    mem = _fader_mem()
+    fader_addr = _plant_fader(mem, "f64")
+    mem.write_f64(fader_addr, 0.998)  # "fully" up, slightly off 1.0
+
+    vals = iter([0.998, 0.003, 0.5])
+
+    def fake_input(_msg: str) -> str:
+        mem.write_f64(fader_addr, next(vals))
+        return ""
+
+    res = fader_scan(
+        mem, 1, prompt=fake_input, echo=lambda _m: None, chunk=1 << 16
+    )
+    assert res.encoding == "f64"
+    assert res.pointers[0] == Pointer((0x2100, 0x40), 0x88)
+
+
+def test_fader_alternatives_roundtrip_and_legacy(tmp_path):
+    from djutil_agent.rbmem.offsets import FaderPointer
+
+    offs = DeckOffsets.from_bases(anlz_base=0x588CB08)
+    offs.fader = [
+        FaderPointer(
+            (Pointer((0x10, 0x20), 0x30), Pointer((0x11, 0x21), 0x31)),
+            "f64",
+        ),
+        None,
+    ]
+    path = tmp_path / "rbmem_offsets.json"
+    save_offsets("7.2.10", offs, path)
+    got = load_offsets("7.2.10", path)
+    assert got is not None and got.fader is not None
+    assert got.fader[0] == offs.fader[0]
+
+    # legacy {"ptr": ..., "enc": ...} still loads as a single-chain entry
+    import json
+
+    raw = json.loads(path.read_text())
+    raw["7.2.10"]["fader"] = [{"ptr": "5BE7928 48 CF8", "enc": "f64"}]
+    path.write_text(json.dumps(raw))
+    got = load_offsets("7.2.10", path)
+    assert got is not None and got.fader is not None
+    assert got.fader[0] is not None
+    assert got.fader[0].chains == (Pointer.parse("5BE7928 48 CF8"),)
+    assert got.fader[0].encoding == "f64"
+
+
+def test_read_fader_falls_back_to_second_chain():
+    from djutil_agent.rbmem.fader import read_fader
+    from djutil_agent.rbmem.offsets import FaderPointer
+
+    mem = _fader_mem()
+    good = _plant_fader(mem, "f64")  # 2100 40 88 -> valid f64
+    mem.write_f64(good, 0.42)
+    broken = Pointer((0xFFFF, 0x40), 0x88)  # resolves nowhere
+
+    entry = FaderPointer((broken, Pointer((0x2100, 0x40), 0x88)), "f64")
+    assert read_fader(mem, entry) == pytest.approx(0.42)
+    # out-of-range value also falls through
+    mem.write_f64(good, 5.0)
+    assert read_fader(mem, entry) is None
 
 
 # -- now-playing -------------------------------------------------------------------

@@ -71,7 +71,7 @@ def _float_candidates(
     chunk: int,
     max_region: int,
 ) -> Any:
-    """Addresses whose ``enc`` float currently reads 1.0."""
+    """Addresses whose ``enc`` float currently reads ~1.0 (>= 0.995)."""
     import numpy as np
 
     out: list[Any] = []
@@ -79,7 +79,7 @@ def _float_candidates(
         start, arr = _float_view(base, data, enc)
         if not arr.size:
             continue
-        idx = np.nonzero(arr == 1.0)[0]
+        idx = np.nonzero((arr >= 0.995) & (arr <= 1.0001))[0]
         align = arr.dtype.itemsize
         out.append(start + idx.astype(np.int64) * align)
     return (
@@ -140,9 +140,9 @@ def _filter(
                     if len(c):
                         v = arr[idx]
                         if kind == "up":
-                            ok = v == 1.0
+                            ok = v >= 0.995
                         elif kind == "down":
-                            ok = v == 0.0
+                            ok = (v <= 0.005) & (v >= -0.0001)
                         elif kind == "half":
                             ok = (v > 0.15) & (v < 0.85)
                         else:  # quarter
@@ -163,7 +163,7 @@ def _filter(
 @dataclass
 class FaderResult:
     encoding: str | None  # None when the hypothesis failed
-    pointer: Pointer | None
+    pointers: list[Pointer]  # validated chains, shortest first
     chains: list[str]
 
 
@@ -213,7 +213,7 @@ def fader_scan(
         echo("  -> survivors: " + ", ".join(parts))
         if all(len(c) == 0 for c in cands.values()):
             echo("  normalized-float hypothesis failed")
-            return FaderResult(None, None, [])
+            return FaderResult(None, [], [])
         total = sum(len(c) for c in cands.values())
         if total <= 3 and done >= 3:
             break
@@ -235,11 +235,11 @@ def fader_scan(
     )
     if not chains:
         echo("  no module-rooted chains found")
-        return FaderResult(None, None, [])
+        return FaderResult(None, [], [])
 
     # validate: the chain must resolve to a live survivor address and read
-    # the value that survivor currently holds
-    best: tuple[str, Pointer] | None = None
+    # the value that survivor currently holds; keep up to 5 alternatives
+    validated: list[tuple[str, Pointer]] = []
     texts: list[str] = []
     for c in chains:
         ptr = c.pointer()
@@ -264,24 +264,43 @@ def fader_scan(
             f"    {c.text()} ({senc}) resolves to {val:.3f} "
             f"(module+{c.module_off:#x})"
         )
-        if best is None:
-            best = (senc, ptr)
-    if best is None:
+        validated.append((senc, ptr))
+    if not validated:
         echo("  no chain validated against the live reading")
-        return FaderResult(None, None, texts)
+        return FaderResult(None, [], texts)
+    enc0 = validated[0][0]
+    pointers = [p for e, p in validated if e == enc0][:5]
     echo(f"  total elapsed {time.monotonic() - t0:.1f}s")
-    return FaderResult(best[0], best[1], texts)
+    return FaderResult(enc0, pointers, texts)
+
+
+def read_fader(reader: MemoryReader, entry: FaderPointer) -> float | None:
+    """First chain that resolves to a plausible fader value, else None."""
+    import math
+    import struct
+
+    size = 4 if entry.encoding == "f32" else 8
+    fmt = "<f" if entry.encoding == "f32" else "<d"
+    for ptr in entry.chains:
+        try:
+            data = reader.read(ptr.resolve(reader), size)
+        except MemoryReadError:
+            continue
+        v: float = struct.unpack(fmt, data)[0]
+        if math.isfinite(v) and -0.01 <= v <= 1.01:
+            return v
+    return None
 
 
 def save_fader(
     version: str,
     channel: int,
-    pointer: Pointer,
+    pointers: list[Pointer],
     encoding: str,
     path: Path | None = None,
     echo: Callable[[str], None] = print,
 ) -> bool:
-    """Merge a discovered fader chain into the saved offsets file."""
+    """Merge discovered fader chains into the saved offsets file."""
     existing = load_offsets(version, path)
     if existing is None or existing.anlz_path is None:
         echo(
@@ -292,7 +311,7 @@ def save_fader(
     fader: list[FaderPointer | None] = list(existing.fader or [None] * 4)
     while len(fader) < channel:
         fader.append(None)
-    fader[channel - 1] = FaderPointer(pointer, encoding)
+    fader[channel - 1] = FaderPointer(tuple(pointers[:5]), encoding)
     existing.fader = fader
     save_offsets(version, existing, path)
     return True

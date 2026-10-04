@@ -48,9 +48,10 @@ def master_index_pointer(base: int) -> Pointer:
 
 @dataclass(frozen=True)
 class FaderPointer:
-    """A channel-fader chain plus the float encoding of its value."""
+    """A channel fader: alternative validated chains (shortest first)
+    plus the float encoding of its value."""
 
-    pointer: Pointer
+    chains: tuple[Pointer, ...]
     encoding: str  # "f32" | "f64"
 
 
@@ -118,7 +119,10 @@ class DeckOffsets:
         out["fader"] = (
             [
                 (
-                    {"ptr": f.pointer.format(), "enc": f.encoding}
+                    {
+                        "enc": f.encoding,
+                        "ptrs": [p.format() for p in f.chains],
+                    }
                     if f is not None
                     else None
                 )
@@ -141,16 +145,22 @@ class DeckOffsets:
         fader: list[FaderPointer | None] | None = None
         raw_fader = data.get("fader")
         if isinstance(raw_fader, list):
-            fader = [
-                (
-                    FaderPointer(
-                        Pointer.parse(str(e["ptr"])), str(e["enc"])
+            fader = []
+            for e in raw_fader:
+                if not isinstance(e, dict):
+                    fader.append(None)
+                    continue
+                ptrs = e.get("ptrs")
+                if isinstance(ptrs, list):
+                    chains = tuple(
+                        Pointer.parse(str(p)) for p in ptrs
                     )
-                    if isinstance(e, dict)
-                    else None
-                )
-                for e in raw_fader
-            ]
+                elif e.get("ptr"):  # legacy single-chain form
+                    chains = (Pointer.parse(str(e["ptr"])),)
+                else:
+                    fader.append(None)
+                    continue
+                fader.append(FaderPointer(chains, str(e["enc"])))
         return cls(
             anlz_path=lst("anlz_path"),
             track_info=lst("track_info"),
