@@ -48,7 +48,8 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = [
-    "test_camelot", "test_reader", "test_watcher", "test_paths", "conftest",
+    "test_camelot", "test_reader", "test_watcher", "test_paths", "test_rbmem",
+    "conftest",
     "tests.*", "*.tests", "*.tests.*",
     "agent.tests.*", "server.tests.*", "shared.tests.*",
 ]

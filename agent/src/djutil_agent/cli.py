@@ -30,6 +30,8 @@ app = typer.Typer(help="DJUtil Rekordbox 6/7 integration agent.")
 logger = logging.getLogger("djutil_agent")
 
 if TYPE_CHECKING:
+    from djutil_agent.rbmem.process import WindowsProcess
+    from djutil_agent.rbmem.scan import DbTrack
     from djutil_agent.sync.engine import SyncEngine
 
 
@@ -363,6 +365,176 @@ def autostart_status() -> None:
         typer.echo(f"enabled: {value}")
     else:
         typer.echo("disabled")
+
+
+decks_app = typer.Typer(
+    help="Read deck state from Rekordbox process memory (Windows, read-only)."
+)
+app.add_typer(decks_app, name="decks")
+
+
+def _open_rekordbox_process() -> WindowsProcess:
+    from djutil_agent.rbmem.process import (
+        ProcessNotFoundError,
+        UnsupportedPlatform,
+        WindowsProcess,
+    )
+
+    try:
+        proc = WindowsProcess()
+    except UnsupportedPlatform as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(2) from exc
+    except ProcessNotFoundError as exc:
+        typer.secho(
+            "rekordbox.exe is not running - start Rekordbox, load tracks "
+            "on at least one (ideally two) decks, then retry.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(2) from exc
+    except Exception as exc:
+        typer.secho(f"could not open Rekordbox process: {exc}",
+                    fg=typer.colors.RED)
+        raise typer.Exit(2) from exc
+    return proc
+
+
+def _deck_db_map() -> dict[str, DbTrack]:
+    from djutil_agent.rbmem.scan import build_db_map
+
+    reader = _reader()
+    return build_db_map(reader.analysis_index())
+
+
+@decks_app.command("scan")
+def decks_scan(
+    save: bool = typer.Option(True, "--save/--no-save"),
+) -> None:
+    """Discover memory pointer chains for the running Rekordbox version."""
+    from djutil_agent.rbmem.offsets import BUILTIN_BASES, save_offsets
+    from djutil_agent.rbmem.scan import scan
+
+    proc = _open_rekordbox_process()
+    version = proc.version or _rekordbox_version() or "unknown"
+    typer.echo(
+        f"Rekordbox {version} (pid {proc.pid}, "
+        f"module @{proc.module_base:#x}, {proc.module_size / 1e6:.0f} MB)"
+    )
+    db = _deck_db_map()
+    typer.echo(f"{len(db)} tracks with analysis paths in master.db")
+
+    result = scan(proc, db, bases=BUILTIN_BASES)
+    for note in result.notes:
+        typer.echo(note)
+    typer.echo(
+        f"scan took {result.elapsed_s:.1f}s; candidates: "
+        + ", ".join(f"{k}={v}" for k, v in result.candidates.items())
+    )
+    offs = result.offsets()
+    if offs is None:
+        typer.secho("no anchor found - nothing discovered",
+                    fg=typer.colors.RED)
+        raise typer.Exit(3)
+    typer.echo("\nDiscovered chains (rkbx_link format):")
+    if offs.master_index:
+        typer.echo(f"  master_index: {offs.master_index.format()}")
+    for name in ("anlz_path", "track_info", "bpm", "position"):
+        ptrs = getattr(offs, name)
+        if not ptrs:
+            typer.echo(f"  {name}: not found")
+            continue
+        for d, p in enumerate(ptrs):
+            typer.echo(f"  {name}[{d}]: {p.format()}")
+    if save:
+        path = save_offsets(version, offs)
+        typer.echo(f"\nSaved to {path}")
+
+
+@decks_app.command("watch")
+def decks_watch(
+    hz: float = typer.Option(5.0, "--hz", min=0.5, max=30),
+) -> None:
+    """Print live deck state (title/BPM/position) until Ctrl+C."""
+    import contextlib
+
+    from djutil_agent.rbmem.offsets import load_offsets
+    from djutil_agent.rbmem.pointer import (
+        read_cstr,
+        read_f32,
+        read_f64,
+        read_u8,
+    )
+    from djutil_agent.rbmem.process import MemoryReadError
+    from djutil_agent.rbmem.scan import norm_anlz_path
+
+    proc = _open_rekordbox_process()
+    version = proc.version or _rekordbox_version() or ""
+    offs = load_offsets(version)
+    if offs is None or offs.anlz_path is None:
+        typer.secho(
+            f"No memory offsets for Rekordbox {version or 'unknown'} - "
+            "run `djutil-agent decks scan` first.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(2)
+    db = _deck_db_map()
+
+    typer.echo(
+        f"Watching {len(offs.anlz_path)} decks at {hz:g} Hz "
+        f"(offsets for {version}). Ctrl+C to stop."
+    )
+    prev: dict[int, tuple[str | None, float]] = {}
+    prev_line = ""
+    try:
+        while True:
+            parts = []
+            master = None
+            if offs.master_index:
+                with contextlib.suppress(MemoryReadError):
+                    master = read_u8(proc, offs.master_index)
+            for d in range(len(offs.anlz_path)):
+                try:
+                    raw = read_cstr(proc, offs.anlz_path[d], 500)
+                except MemoryReadError:
+                    continue
+                norm = norm_anlz_path(raw)
+                track = db.get(norm) if norm else None
+                title = None
+                if offs.track_info:
+                    with contextlib.suppress(MemoryReadError):
+                        info = read_cstr(proc, offs.track_info[d], 200)
+                        title = info.split("\n")[0].strip() or None
+                title = title or (track.title if track else "?")
+                bpm = pos = None
+                if offs.bpm:
+                    with contextlib.suppress(MemoryReadError):
+                        bpm = read_f32(proc, offs.bpm[d])
+                if offs.position:
+                    with contextlib.suppress(MemoryReadError):
+                        pos = read_f64(proc, offs.position[d])
+                playing = (
+                    pos is not None
+                    and d in prev
+                    and prev[d][1] is not None
+                    and pos != prev[d][1]
+                )
+                prev[d] = (norm, pos or 0.0)
+                mark = "*" if master == d else " "
+                cid = track.content_id if track else "-"
+                parts.append(
+                    f"{mark}d{d} {'PLAY' if playing else '    '} "
+                    f"{title} bpm={bpm if bpm is not None else '?'} "
+                    f"pos={pos if pos is not None else '?'} cid={cid}"
+                )
+            line = " | ".join(parts)
+            if line and line != prev_line:
+                typer.echo(
+                    f"{time.strftime('%H:%M:%S')} master={master} {line}"
+                )
+                prev_line = line
+            time.sleep(1.0 / hz)
+    except KeyboardInterrupt:
+        typer.echo("\nStopped.")
 
 
 if __name__ == "__main__":

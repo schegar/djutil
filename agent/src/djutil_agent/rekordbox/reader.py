@@ -388,6 +388,18 @@ class RekordboxReader:
             "history_entries": one("SELECT COUNT(*) FROM djmdSongHistory"),
         }
 
+    def analysis_index(self) -> list[dict[str, Any]]:
+        """ContentID, title, raw BPM and AnalysisDataPath for live tracks.
+
+        Used by `decks scan`/`watch` to identify tracks loaded in Rekordbox
+        decks by their in-memory ANLZ path.
+        """
+        return self._rows(
+            "SELECT ID, Title, BPM, AnalysisDataPath FROM djmdContent"
+            " WHERE rb_local_deleted = 0"
+            " AND AnalysisDataPath IS NOT NULL AND AnalysisDataPath != ''"
+        )
+
     # -- delta sync ----------------------------------------------------------
 
     @staticmethod
