@@ -8,7 +8,8 @@ validates candidates against master.db contents:
 a. ANLZ path   - resolved string must be a known AnalysisDataPath
 b. track info  - first line must equal the DB title of the deck's track
    (same base also gives the master-deck-index chain, validated u8 0..3)
-c. BPM/position - f32 within +/-10% of the DB BPM (or half/double), f64 >= 0
+c. BPM/position - f32 within +/-10% of the DB BPM (or half/double),
+   i64 sample count in [0, 44100*3h)
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from .offsets import (
     position_pointer,
     track_info_pointer,
 )
-from .pointer import read_cstr, read_f32, read_f64, read_u8, read_u64
+from .pointer import read_cstr, read_f32, read_i64, read_u8, read_u64
 from .process import MemoryReader, MemoryReadError
 
 DEFAULT_WINDOW = 16 * 1024 * 1024  # +/- 16 MB around the 7.2.2 base
@@ -266,14 +267,14 @@ class _Scanner:
             for d, cid in deck_content.items():
                 try:
                     bpm = read_f32(self.reader, bpm_pointer(slot, d))
-                    pos = read_f64(self.reader, position_pointer(slot, d))
+                    pos = read_i64(self.reader, position_pointer(slot, d))
                 except MemoryReadError:
                     ok = False
                     break
                 if not self._bpm_ok(bpm, by_content[cid].bpm):
                     ok = False
                     break
-                if not (math.isfinite(pos) and pos >= 0):
+                if not (0 <= pos < 44100 * 3 * 3600):  # samples, < 3 h
                     ok = False
                     break
             if not ok:

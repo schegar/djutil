@@ -64,6 +64,11 @@ def read_f64(reader: MemoryReader, ptr: Pointer) -> float:
     return v
 
 
+def read_i64(reader: MemoryReader, ptr: Pointer) -> int:
+    return int.from_bytes(reader.read(ptr.resolve(reader), 8), "little",
+                          signed=True)
+
+
 def read_cstr(reader: MemoryReader, ptr: Pointer, maxlen: int) -> str:
     data = reader.read(ptr.resolve(reader), maxlen)
     nul = data.find(b"\x00")

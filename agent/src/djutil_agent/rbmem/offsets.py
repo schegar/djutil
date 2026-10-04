@@ -16,6 +16,7 @@ from ..platform.paths import agent_data_dir
 from .pointer import Pointer
 
 NUM_DECKS = 4
+SAMPLE_RATE = 44100  # position values are i64 sample counts
 
 # -- chain shapes (inner offsets stable across versions, by hypothesis) ------
 

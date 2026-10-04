@@ -446,22 +446,72 @@ def decks_scan(
         for d, p in enumerate(ptrs):
             typer.echo(f"  {name}[{d}]: {p.format()}")
     if save:
+        from djutil_agent.rbmem.offsets import load_offsets
+
+        # don't clobber a master_index found by `decks master-scan`
+        existing = load_offsets(version)
+        if (
+            offs.master_index is None
+            and existing is not None
+            and existing.master_index is not None
+        ):
+            offs.master_index = existing.master_index
         path = save_offsets(version, offs)
         typer.echo(f"\nSaved to {path}")
+
+
+@decks_app.command("master-scan")
+def decks_master_scan() -> None:
+    """Interactively discover the master-deck-index chain (press MASTER on
+    decks 1/2 when prompted)."""
+    from djutil_agent.rbmem.master import master_scan, save_master_index
+
+    proc = _open_rekordbox_process()
+    version = proc.version or _rekordbox_version() or "unknown"
+    typer.echo(
+        f"Rekordbox {version} (pid {proc.pid}, "
+        f"module @{proc.module_base:#x})"
+    )
+    slot, fallback = master_scan(proc, echo=typer.echo)
+    if slot is None and not fallback:
+        raise typer.Exit(3)
+    if slot is not None:
+        typer.echo(f"\nmaster_index chain: {slot:X} 20 278 124")
+    else:
+        typer.echo("\ndifferential survivors (direct statics, `X 0`):")
+        for off in fallback:
+            typer.echo(f"  {off:X} 0   (module+{off:#x})")
+        if len(fallback) != 1:
+            typer.echo(
+                "more than one survivor - not saving; re-run after pressing "
+                "MASTER a few times"
+            )
+            raise typer.Exit(3)
+    if save_master_index(
+        version,
+        slot,
+        fallback[0] if slot is None and len(fallback) == 1 else None,
+        echo=typer.echo,
+    ):
+        typer.echo("Saved.")
 
 
 @decks_app.command("watch")
 def decks_watch(
     hz: float = typer.Option(5.0, "--hz", min=0.5, max=30),
+    seconds: float = typer.Option(
+        0.0, "--seconds", help="Stop after N seconds (0 = unlimited)"
+    ),
 ) -> None:
     """Print live deck state (title/BPM/position) until Ctrl+C."""
     import contextlib
 
-    from djutil_agent.rbmem.offsets import load_offsets
+    from djutil_agent.rbmem.master import DeckSnap, pick_now_playing
+    from djutil_agent.rbmem.offsets import SAMPLE_RATE, load_offsets
     from djutil_agent.rbmem.pointer import (
         read_cstr,
         read_f32,
-        read_f64,
+        read_i64,
         read_u8,
     )
     from djutil_agent.rbmem.process import MemoryReadError
@@ -483,10 +533,16 @@ def decks_watch(
         f"Watching {len(offs.anlz_path)} decks at {hz:g} Hz "
         f"(offsets for {version}). Ctrl+C to stop."
     )
+    if offs.master_index is None:
+        typer.echo("master index unknown - run `djutil-agent decks master-scan`")
     prev: dict[int, tuple[str | None, float]] = {}
+    snaps: dict[int, DeckSnap] = {}
     prev_line = ""
+    prev_np: tuple[int | None, str | None] = (None, None)
+    t_start = time.monotonic()
     try:
         while True:
+            now = time.monotonic()
             parts = []
             master = None
             if offs.master_index:
@@ -511,7 +567,7 @@ def decks_watch(
                         bpm = read_f32(proc, offs.bpm[d])
                 if offs.position:
                     with contextlib.suppress(MemoryReadError):
-                        pos = read_f64(proc, offs.position[d])
+                        pos = read_i64(proc, offs.position[d])
                 playing = (
                     pos is not None
                     and d in prev
@@ -519,13 +575,47 @@ def decks_watch(
                     and pos != prev[d][1]
                 )
                 prev[d] = (norm, pos or 0.0)
+                cid = track.content_id if track else None
+                snap = snaps.get(d)
+                if snap is None:
+                    snap = DeckSnap(False, None, None, "")
+                if playing:
+                    if not snap.playing:
+                        snap.playing_since = now
+                    snap.playing = True
+                else:
+                    snap.playing = False
+                    snap.playing_since = None
+                snap.content_id = cid
+                snap.title = title or "?"
+                snaps[d] = snap
                 mark = "*" if master == d else " "
-                cid = track.content_id if track else "-"
+                pos_s = f"{pos / SAMPLE_RATE:.2f}s" if pos is not None else "?"
                 parts.append(
                     f"{mark}d{d} {'PLAY' if playing else '    '} "
                     f"{title} bpm={bpm if bpm is not None else '?'} "
-                    f"pos={pos if pos is not None else '?'} cid={cid}"
+                    f"pos={pos_s} cid={cid or '-'}"
                 )
+            assert offs.anlz_path is not None
+            np_idx = pick_now_playing(
+                [
+                    snaps.get(d, DeckSnap(False, None, None, ""))
+                    for d in range(len(offs.anlz_path))
+                ],
+                master,
+                now,
+            )
+            np_state: tuple[int | None, str | None] = (None, None)
+            if np_idx is not None:
+                snap = snaps[np_idx]
+                np_state = (np_idx, snap.content_id)
+            if np_state != prev_np and np_state[0] is not None:
+                snap = snaps[np_state[0]]
+                typer.echo(
+                    f"{time.strftime('%H:%M:%S')} NOW PLAYING: {snap.title} "
+                    f"[{snap.content_id}] (deck {np_state[0]})"
+                )
+            prev_np = np_state
             line = " | ".join(parts)
             if line and line != prev_line:
                 typer.echo(
@@ -533,6 +623,8 @@ def decks_watch(
                 )
                 prev_line = line
             time.sleep(1.0 / hz)
+            if seconds and now - t_start >= seconds:
+                break
     except KeyboardInterrupt:
         typer.echo("\nStopped.")
 

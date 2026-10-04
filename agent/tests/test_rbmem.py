@@ -279,7 +279,7 @@ def _plant_bpm_pos(
     third = mem.alloc(0x400)
     mem.write_u64(second + 0x2B0, third)
     mem.write_f32(third + 0x1A0, bpm)
-    mem.write_f64(third + 0x130, pos)
+    mem.write(third + 0x130, int(pos).to_bytes(8, "little", signed=True))
     return first
 
 
@@ -299,7 +299,8 @@ def test_scan_finds_shifted_bases():
             mem, info_base, d, track.title, chain=info_chain
         )
         decks_first = _plant_bpm_pos(
-            mem, decks_base, d, track.bpm or 0, 1234.5 + d, decks_first
+            mem, decks_base, d, track.bpm or 0, 1234567 + d * 44100,
+            decks_first,
         )
 
     res = scan(mem, db, window=0x140000, chunk=1 << 16)
@@ -406,6 +407,123 @@ def test_probe_reverse_walk_recovers_chain():
     assert c.inners == [0x40, 0x88]
     assert c.text() == "2000 40 88 0"
     assert c.content_id == "c1"
+
+
+# -- master-scan -------------------------------------------------------------------
+
+
+def _plant_master(mem: FakeMemory, slot: int) -> int:
+    """Plant `slot 20 278 124` -> u8; returns the value address."""
+    first = mem.alloc(64)
+    mem.write_u64(mem.module_base + slot, first)
+    a = mem.alloc(0x400)
+    mem.write_u64(first + 0x20, a)
+    m = mem.alloc(0x200)
+    mem.write_u64(a + 0x278, m)
+    return m + 0x124
+
+
+def test_master_scan_shaped_filters(tmp_path):
+    from djutil_agent.rbmem.master import master_scan
+
+    mem = FakeMemory()
+    real = _plant_master(mem, BASE_722_INFO + 0x100)
+    stuck = _plant_master(mem, BASE_722_INFO - 0x80)  # never flips
+    mem.write_u8(stuck, 0)
+
+    seq = iter([0, 1, 0, 1])
+    prompts: list[str] = []
+
+    def fake_input(msg: str) -> str:
+        prompts.append(msg)
+        mem.write_u8(real, next(seq))
+        return ""
+
+    steps = (
+        ("press deck1", 0),
+        ("press deck2", 1),
+        ("press deck1 again", 0),
+        ("press deck2 again", 1),
+    )
+    slot, fallback = master_scan(
+        mem, steps=steps, prompt=fake_input, echo=lambda _m: None,
+        window=0x2000, chunk=1 << 16,
+    )
+    assert fallback == []
+    assert slot == BASE_722_INFO + 0x100
+    assert len(prompts) == 2  # early stop once only one survivor remains
+
+
+def test_master_scan_differential_fallback(tmp_path):
+    from djutil_agent.rbmem.master import differential_scan
+
+    mem = _probe_mem()
+    cell = mem.module_base + 0x234
+    mem.write_u8(cell, 9)  # not yet 0/1
+
+    seq = iter([0, 1, 0, 1])
+
+    def fake_input(_msg: str) -> str:
+        mem.write_u8(cell, next(seq))
+        return ""
+
+    steps = (("d1", 0), ("d2", 1), ("d1", 0), ("d2", 1))
+    found = differential_scan(
+        mem, steps=steps, prompt=fake_input, echo=lambda _m: None,
+        chunk=1 << 16,
+    )
+    assert 0x234 in found
+    # only offsets that actually flip 0/1/0/1 survive (noise is all zero,
+    # which fails at step 2 expecting 1)
+    assert len(found) == 1
+
+
+def test_master_save_merges(tmp_path):
+    from djutil_agent.rbmem.master import save_master_index
+
+    offs = DeckOffsets.from_bases(anlz_base=0x588CB08)
+    path = tmp_path / "rbmem_offsets.json"
+    save_offsets("7.2.10", offs, path)
+
+    assert save_master_index("7.2.10", 0x5738C48, None, path,
+                             echo=lambda _m: None)
+    got = load_offsets("7.2.10", path)
+    assert got is not None
+    assert got.master_index is not None
+    assert got.master_index.offsets == (0x5738C48, 0x20, 0x278)
+    # other fields preserved
+    assert got.anlz_path == offs.anlz_path
+    # direct-static fallback stores `X 0`
+    assert save_master_index("7.2.10", None, 0xABCDE, path,
+                             echo=lambda _m: None)
+    got = load_offsets("7.2.10", path)
+    assert got is not None
+    assert got.master_index == Pointer((0xABCDE,), 0)
+    # no entry at all -> refused
+    assert not save_master_index("9.9.9", 0x1000, None, path,
+                                 echo=lambda _m: None)
+
+
+def test_pick_now_playing():
+    from djutil_agent.rbmem.master import DeckSnap, pick_now_playing
+
+    def deck(playing, since, cid="x"):
+        return DeckSnap(playing, since, cid, "t")
+
+    # master index wins when that deck is playing
+    decks = [deck(True, 0.0, "a"), deck(True, 5.0, "b")]
+    assert pick_now_playing(decks, 1, now=100.0) == 1
+    # master deck not playing -> None
+    decks = [deck(True, 0.0, "a"), deck(False, None, "b")]
+    assert pick_now_playing(decks, 1, now=100.0) is None
+    # fallback: most recently started deck playing >= 10 s
+    decks = [deck(True, 50.0, "a"), deck(True, 80.0, "b")]
+    assert pick_now_playing(decks, None, now=100.0) == 1
+    # too fresh (<10 s) -> None
+    decks = [deck(True, 95.0, "a"), deck(False, None, "b")]
+    assert pick_now_playing(decks, None, now=100.0) is None
+    # invalid master index -> None
+    assert pick_now_playing(decks, 9, now=100.0) is None
 
 
 def test_probe_seed_selection_absolute_only():
