@@ -781,6 +781,60 @@ def test_read_fader_falls_back_to_second_chain():
     assert read_fader(mem, entry) is None
 
 
+def _plant_static_f64(mem: FakeMemory, slot: int, val: float) -> Pointer:
+    a = mem.alloc(8)
+    mem.write_u64(mem.module_base + slot, a)
+    mem.write_f64(a, val)
+    return Pointer((slot,), 0)
+
+
+def test_read_fader_consensus():
+    from djutil_agent.rbmem.fader import read_fader
+    from djutil_agent.rbmem.offsets import FaderPointer
+
+    mem = _fader_mem()
+    stale = _plant_static_f64(mem, 0x2200, 0.0)   # stale -> reads 0.0
+    good1 = _plant_static_f64(mem, 0x2208, 0.37)
+    good2 = _plant_static_f64(mem, 0x2210, 0.372)
+    # one stale + two agreeing -> majority wins
+    entry = FaderPointer((stale, good1, good2), "f64")
+    assert read_fader(mem, entry) == pytest.approx((0.37 + 0.372) / 2)
+    # all disagree -> earliest chain's value
+    mem.write_f64(good1.resolve(mem), 0.9)
+    assert read_fader(mem, entry) == pytest.approx(0.0)
+
+
+def test_offsets_builtin_fills_missing_fader(tmp_path):
+    mem_path = tmp_path / "rbmem_offsets.json"
+    # saved entry without fader/master -> filled from the 7.2.10 built-in
+    offs = DeckOffsets.from_bases(anlz_base=0x588CB08)
+    save_offsets("7.2.10", offs, mem_path)
+    got = load_offsets("7.2.10", mem_path)
+    assert got is not None
+    assert got.fader is not None and len(got.fader) == 4
+    assert got.fader[0] is not None
+    assert got.fader[0].encoding == "f64"
+    assert got.fader[0].chains[0] == Pointer((0x5BE7928, 0x48), 0xCF0)
+    assert got.fader[0].chains[1] == Pointer(
+        (0x5AE3048, 0x20, 0x238), 0xE08
+    )
+    assert got.master_index is not None  # filled too
+    # saved field wins over built-in
+    assert got.anlz_path == offs.anlz_path
+
+    # per-channel merge: saved channel kept, missing channels filled
+    from djutil_agent.rbmem.offsets import FaderPointer
+
+    offs2 = DeckOffsets.from_bases(anlz_base=0x588CB08)
+    mine = FaderPointer((Pointer((0x10,), 0),), "f32")
+    offs2.fader = [mine, None, None, None]
+    save_offsets("7.2.10", offs2, mem_path)
+    got = load_offsets("7.2.10", mem_path)
+    assert got is not None and got.fader is not None
+    assert got.fader[0] == mine
+    assert got.fader[1] is not None and got.fader[1].encoding == "f64"
+
+
 # -- now-playing -------------------------------------------------------------------
 
 

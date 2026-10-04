@@ -270,17 +270,29 @@ def fader_scan(
         return FaderResult(None, [], texts)
     enc0 = validated[0][0]
     pointers = [p for e, p in validated if e == enc0][:5]
+    echo(
+        "  tip: channels are usually an 8-byte stride - "
+        "compare with other channels"
+    )
     echo(f"  total elapsed {time.monotonic() - t0:.1f}s")
     return FaderResult(enc0, pointers, texts)
 
 
 def read_fader(reader: MemoryReader, entry: FaderPointer) -> float | None:
-    """First chain that resolves to a plausible fader value, else None."""
+    """Consensus fader value over the alternative chains.
+
+    Chains that fail to resolve or read outside [-0.01, 1.01] are
+    discarded; the rest are clustered (agreement within 0.01) and the
+    mean of the largest cluster wins - a stale chain reading 0.0 can no
+    longer poison the result.  Ties go to the cluster containing the
+    earliest chain.
+    """
     import math
     import struct
 
     size = 4 if entry.encoding == "f32" else 8
     fmt = "<f" if entry.encoding == "f32" else "<d"
+    vals: list[float] = []
     for ptr in entry.chains:
         try:
             data = reader.read(ptr.resolve(reader), size)
@@ -288,8 +300,26 @@ def read_fader(reader: MemoryReader, entry: FaderPointer) -> float | None:
             continue
         v: float = struct.unpack(fmt, data)[0]
         if math.isfinite(v) and -0.01 <= v <= 1.01:
-            return v
-    return None
+            vals.append(v)
+    return _consensus(vals)
+
+
+def _consensus(vals: list[float]) -> float | None:
+    """Mean of the largest cluster (|v - mean| <= 0.01); earliest chain
+    breaks ties."""
+    groups: list[list[float]] = []
+    for v in vals:
+        for g in groups:
+            if abs(v - sum(g) / len(g)) <= 0.01:
+                g.append(v)
+                break
+        else:
+            groups.append([v])
+    if not groups:
+        return None
+    best = max(range(len(groups)), key=lambda i: (len(groups[i]), -i))
+    g = groups[best]
+    return sum(g) / len(g)
 
 
 def save_fader(

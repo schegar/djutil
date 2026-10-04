@@ -583,15 +583,19 @@ def decks_check() -> None:
         if entry is None:
             continue
         fv = read_fader(proc, entry)
+        import struct
+
+        size = 4 if entry.encoding == "f32" else 8
+        fmt = "<f" if entry.encoding == "f32" else "<d"
         for j, p in enumerate(entry.chains):
             try:
-                addr = p.resolve(proc)
+                v = struct.unpack(fmt, proc.read(p.resolve(proc), size))[0]
             except MemoryReadError:
                 line(f"fader[{d}] alt{j}", False, "resolve failed")
             else:
-                line(f"fader[{d}] alt{j}", True, f"@{addr:#x}")
+                line(f"fader[{d}] alt{j}", True, f"{v:.3f}")
         line(
-            f"fader[{d}] ({entry.encoding})",
+            f"fader[{d}] consensus ({entry.encoding})",
             fv is not None,
             f"{fv:.3f}" if fv is not None else "no working chain",
         )

@@ -177,6 +177,25 @@ BUILTIN: dict[str, DeckOffsets] = {
         info_base=BASE_722_INFO,
         decks_base=BASE_722_DECKS,
     ),
+    # discovered on Windows 7.2.10; track_info not found.
+    "7.2.10": DeckOffsets(
+        anlz_path=[anlz_pointer(0x5B1BB98, d) for d in range(NUM_DECKS)],
+        bpm=[bpm_pointer(0x59E6EB8, d) for d in range(NUM_DECKS)],
+        position=[
+            position_pointer(0x59E6EB8, d) for d in range(NUM_DECKS)
+        ],
+        master_index=Pointer((0x5AE3048, 0x20, 0x278), 0x124),
+        fader=[
+            FaderPointer(
+                (
+                    Pointer((0x5BE7928, 0x48), 0xCF0 + 8 * d),
+                    Pointer((0x5AE3048, 0x20, 0x238), 0xE08 + 8 * d),
+                ),
+                "f64",
+            )
+            for d in range(NUM_DECKS)
+        ],
+    ),
 }
 
 BUILTIN_BASES = {
@@ -202,7 +221,35 @@ def load_offsets(
             data = {}
         entry = data.get(version)
         if isinstance(entry, dict):
-            return DeckOffsets.from_json(entry)
+            offs = DeckOffsets.from_json(entry)
+            built = BUILTIN.get(version)
+            if built is not None:
+                # saved wins; fill gaps (e.g. fader) from the built-in
+                for field in (
+                    "anlz_path",
+                    "track_info",
+                    "bpm",
+                    "position",
+                    "master_index",
+                ):
+                    if getattr(offs, field) is None:
+                        setattr(offs, field, getattr(built, field))
+                if built.fader is not None:
+                    merged = list(offs.fader or [None] * NUM_DECKS)
+                    merged += [None] * max(
+                        0, len(built.fader) - len(merged)
+                    )
+                    offs.fader = [
+                        f
+                        if f is not None
+                        else (
+                            built.fader[i]
+                            if i < len(built.fader)
+                            else None
+                        )
+                        for i, f in enumerate(merged)
+                    ]
+            return offs
     return BUILTIN.get(version)
 
 
