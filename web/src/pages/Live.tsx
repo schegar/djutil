@@ -234,7 +234,7 @@ export function Live() {
                   className="flex items-center gap-3 px-3 py-2 hover:bg-neutral-900"
                 >
                   <span
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold text-black"
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold text-neutral-200"
                     style={{
                       backgroundColor: rankColor(i, s.suggestions.length),
                     }}
