@@ -7,6 +7,7 @@ import { Badge } from "../components/ui/badge";
 import { useLiveSocket } from "../hooks/useLiveSocket";
 import { camelotColor } from "../lib/camelot";
 import { formatTime } from "../lib/format";
+import { rankColor } from "../lib/rank";
 import { cn } from "../lib/utils";
 
 export function Live() {
@@ -226,12 +227,30 @@ export function Live() {
         </h2>
         {s && s.suggestions.length > 0 ? (
           <ol className="divide-y divide-neutral-900 rounded-lg border border-neutral-800">
-            {s.suggestions.map((sug) => (
+            {s.suggestions.map((sug, i) => (
               <li key={sug.track.id}>
                 <Link
                   to={`/tracks/${encodeURIComponent(sug.track.id)}`}
                   className="flex items-center gap-3 px-3 py-2 hover:bg-neutral-900"
                 >
+                  <span
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold text-black"
+                    style={{
+                      backgroundColor: rankColor(i, s.suggestions.length),
+                    }}
+                  >
+                    {i + 1}
+                  </span>
+                  {sug.track.artwork_hash ? (
+                    <img
+                      src={api.artworkUrl(sug.track.artwork_hash)}
+                      alt=""
+                      loading="lazy"
+                      className="h-10 w-10 shrink-0 rounded object-cover"
+                    />
+                  ) : (
+                    <div className="h-10 w-10 shrink-0 rounded bg-neutral-800" />
+                  )}
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm">
                       {sug.track.artist} –{" "}
