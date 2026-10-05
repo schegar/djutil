@@ -1,10 +1,14 @@
 """Fader-aware now-playing decision (pure; reused by `decks watch` and,
 later, the live forwarder).
 
-A deck is *audible* while it is playing and its channel fader is up (or
-unknown).  Now-playing is the audible deck with the most recent audible
-start that has stayed audible for at least ``min_audible_s``; failing
-that, the previous pick survives while still audible.
+A deck is *audible* while it is playing and its channel fader is up
+(*confirmed*), or while it is playing with the fader unreadable
+(*assumed*).  Now-playing is the audible deck with the most recent
+audible start that has stayed audible for at least ``min_audible_s`` —
+but a merely assumed deck never wins while a confirmed deck is audible:
+a track playing with its fader down on an unmapped channel must not
+steal now-playing from the deck that is verifiably up.  Failing any
+qualified pick, the previous pick survives while still audible.
 """
 
 from __future__ import annotations
@@ -65,10 +69,12 @@ class NowPlayingTracker:
     ) -> None:
         self.min_audible_s = min_audible_s
         self.gap_grace_s = gap_grace_s
-        # per deck: (cid, audible_since, gap_start)
+        # per deck: (cid, audible_since, gap_start, confirmed)
         # gap_start is the first non-audible ts of the current gap
-        # (None while the deck is audible at the latest sample)
-        self._aud: dict[int, tuple[str, float, float | None]] = {}
+        # (None while the deck is audible at the latest sample);
+        # confirmed records whether audibility last rested on a known-up
+        # fader (False = fader unreadable, audibility assumed)
+        self._aud: dict[int, tuple[str, float, float | None, bool]] = {}
         self._key: tuple[int, str, float] | None = None
 
     def update(
@@ -79,11 +85,11 @@ class NowPlayingTracker:
     ) -> NowPlayingEvent | None:
         """Returns an event when the now-playing pick changes, else None."""
         for i, d in enumerate(decks):
-            audible = (
-                d.playing
-                and d.cid is not None
-                and (d.fader is None or d.fader > FADER_MIN)
+            playing = d.playing and d.cid is not None
+            confirmed = (
+                playing and d.fader is not None and d.fader > FADER_MIN
             )
+            audible = confirmed or (playing and d.fader is None)
             cur = self._aud.get(i)
             cid_changed = (
                 cur is not None and d.cid is not None and d.cid != cur[0]
@@ -96,24 +102,29 @@ class NowPlayingTracker:
                     cur[2] is None or now - cur[2] <= self.gap_grace_s
                 ):
                     # continuous, or resumed inside the grace window
-                    self._aud[i] = (cur[0], cur[1], None)
+                    self._aud[i] = (cur[0], cur[1], None, confirmed)
                 else:
-                    self._aud[i] = (d.cid, now, None)
+                    self._aud[i] = (d.cid, now, None, confirmed)
             elif cur is not None:
                 gap = cur[2] if cur[2] is not None else now
                 if now - gap > self.gap_grace_s:
                     self._aud.pop(i, None)
                 else:
-                    self._aud[i] = (cur[0], cur[1], gap)
+                    self._aud[i] = (cur[0], cur[1], gap, cur[3])
 
+        # confirmed (fader known up) beats assumed (fader unreadable)
         pick: int | None = None
         pick_since = -1.0
-        for i, (_cid, since, _last) in self._aud.items():
-            if (
-                now - since >= self.min_audible_s
-                and since > pick_since
-            ):
-                pick, pick_since = i, since
+        for tier in (True, False):
+            for i, (_cid, since, _gap, conf) in self._aud.items():
+                if (
+                    conf == tier
+                    and now - since >= self.min_audible_s
+                    and since > pick_since
+                ):
+                    pick, pick_since = i, since
+            if pick is not None:
+                break
         if pick is None and self._key is not None:
             prev_deck = self._key[0]
             entry = self._aud.get(prev_deck)
@@ -121,7 +132,7 @@ class NowPlayingTracker:
                 pick = prev_deck
         if pick is None:
             return None
-        cid, since, _last = self._aud[pick]
+        cid, since, _gap, _conf = self._aud[pick]
         key = (pick, cid, since)
         if key == self._key:
             return None

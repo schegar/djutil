@@ -991,6 +991,27 @@ def test_now_playing_no_fader_fallback():
     assert ev is not None and ev.deck == 0
 
 
+def test_now_playing_unknown_fader_does_not_steal():
+    from djutil_agent.rbmem.nowplaying import DeckSample, NowPlayingTracker
+
+    def d(cid: str, playing: bool, fader: float | None) -> DeckSample:
+        return DeckSample(cid, "t", playing, fader)
+
+    tr = NowPlayingTracker(min_audible_s=5.0, gap_grace_s=3.0)
+    tr.update(0.0, 0.0, [d("A", True, 1.0), d("B", False, None)])
+    ev = tr.update(6.0, 6.0, [d("A", True, 1.0), d("B", False, None)])
+    assert ev is not None and ev.deck == 0
+    # B starts playing but its fader can't be read: never steals while
+    # A is verifiably audible
+    assert tr.update(10.0, 10.0, [d("A", True, 1.0), d("B", True, None)]) is None
+    assert tr.update(20.0, 20.0, [d("A", True, 1.0), d("B", True, None)]) is None
+    # A's fader drops -> within grace A still counts; past it B takes over
+    assert tr.update(21.0, 21.0, [d("A", True, 0.0), d("B", True, None)]) is None
+    ev = tr.update(25.0, 25.0, [d("A", True, 0.0), d("B", True, None)])
+    assert ev is not None and ev.deck == 1 and ev.cid == "B"
+    assert ev.audible_since == 10.0
+
+
 # -- deckwatch ------------------------------------------------------------------
 
 
