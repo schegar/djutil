@@ -222,7 +222,14 @@ class LiveForwarder:
 
     async def _poll_loop(self) -> None:
         while not self._stop.is_set():
-            self._enqueue(self.watcher.poll())
+            try:
+                # off the event loop: reading the live SQLCipher master.db
+                # can stall long enough to drop the WS pings
+                events = await asyncio.to_thread(self.watcher.poll)
+            except Exception:
+                logger.exception("history watcher poll failed")
+                events = []
+            self._enqueue(events)
             await asyncio.sleep(1.0)
 
     async def _deck_loop(self) -> None:
@@ -244,7 +251,10 @@ class LiveForwarder:
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self.watcher.prime()
+        try:
+            await asyncio.to_thread(self.watcher.prime)
+        except Exception:
+            logger.exception("history watcher prime failed")
         loops = [self._poll_loop(), self._ws_loop()]
         if self.deck_watcher is not None:
             loops.append(self._deck_loop())

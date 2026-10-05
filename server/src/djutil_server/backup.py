@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -31,12 +32,9 @@ def run_backup(db_path: Path, dest_dir: Path, keep: int) -> Path:
     """Online-backup `db_path` into dest_dir and verify the copy."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / backup_name()
-    # Try read-only first (the backup service mounts the data volume ro);
-    # fall back to a normal connection if the WAL needs recovery.
-    try:
-        src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        src = sqlite3.connect(db_path)
+    # Read-write connection: a WAL database needs shm/wal access, which a
+    # read-only open can't always do. The backup API itself is online-safe.
+    src = sqlite3.connect(db_path, timeout=60)
     try:
         dst = sqlite3.connect(dest)
         try:
@@ -55,6 +53,12 @@ def run_backup(db_path: Path, dest_dir: Path, keep: int) -> Path:
 
 def backup_loop(db_path: Path, dest_dir: Path, keep: int, hours: float) -> None:
     while True:
-        dest = run_backup(db_path, dest_dir, keep)
+        try:
+            dest = run_backup(db_path, dest_dir, keep)
+        except Exception:
+            traceback.print_exc()
+            print("backup failed; retrying in 60 s", flush=True)
+            time.sleep(60)
+            continue
         print(f"backup written: {dest}", flush=True)
         time.sleep(hours * 3600)

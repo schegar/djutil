@@ -13,8 +13,10 @@ services:
 
   backup:
     # Nightly SQLite online backup into ./backups (keeps newest 14).
-    # The data volume is mounted read-only; artwork is not backed up —
-    # the agent re-uploads it after a restore.
+    # The data volume is mounted read-write: a WAL database can't be
+    # opened read-only while it has a hot journal. The SQLite backup API
+    # is online-safe, so this cannot corrupt the live DB. Artwork is not
+    # backed up — the agent re-uploads it after a restore.
     image: ${DJUTIL_IMAGE:-ghcr.io/schegar/djutil:latest}
     build:
       context: ..
@@ -23,7 +25,7 @@ services:
     command: ["python", "-m", "djutil_server", "backup",
               "--dir", "/backups", "--keep", "14", "--loop-hours", "24"]
     volumes:
-      - djutil-data:/data:ro
+      - djutil-data:/data
       - ./backups:/backups
     restart: unless-stopped
 
