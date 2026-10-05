@@ -11,6 +11,7 @@ from sqlalchemy.engine import Engine
 
 from .auth import require_user
 from .deps import get_engine
+from .live_api import publish_live_state
 from .schemas import (
     ImportAllResult,
     ImportResult,
@@ -75,7 +76,7 @@ def list_sets(engine: Engine = Depends(get_engine)) -> list[SetOut]:
 
 
 @router.post("/sets/start", response_model=SetOut, status_code=201)
-def start_set(
+async def start_set(
     body: SetStartRequest, request: Request, engine: Engine = Depends(get_engine)
 ) -> SetOut:
     settings = request.app.state.settings
@@ -95,11 +96,15 @@ def start_set(
             {"n": name, "s": now},
         )
         sid = int(res.lastrowid)
-    return get_set(sid, engine)
+    out = get_set(sid, engine)
+    await publish_live_state(request.app)
+    return out
 
 
 @router.post("/sets/{set_id}/stop", response_model=SetOut)
-def stop_set(set_id: int, engine: Engine = Depends(get_engine)) -> SetOut:
+async def stop_set(
+    set_id: int, request: Request, engine: Engine = Depends(get_engine)
+) -> SetOut:
     with engine.begin() as conn:
         s = conn.execute(
             text("SELECT id, ended_at FROM sets WHERE id = :id"), {"id": set_id}
@@ -111,7 +116,9 @@ def stop_set(set_id: int, engine: Engine = Depends(get_engine)) -> SetOut:
                 text("UPDATE sets SET ended_at = :e WHERE id = :id"),
                 {"e": datetime.now(UTC), "id": set_id},
             )
-    return get_set(set_id, engine)
+    out = get_set(set_id, engine)
+    await publish_live_state(request.app)
+    return out
 
 
 @router.get("/sets/{set_id}", response_model=SetDetail)

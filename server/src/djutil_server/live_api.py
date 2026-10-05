@@ -62,7 +62,7 @@ def _name_fn(settings: Settings) -> Callable[[datetime], str]:
     return name
 
 
-async def _publish(app: FastAPI) -> None:
+async def publish_live_state(app: FastAPI) -> None:
     state = live_state(app.state.engine, app.state.hub)
     await app.state.hub.broadcast(LiveState.model_validate(state).model_dump(mode="json"))
 
@@ -81,7 +81,7 @@ async def agent_ws(ws: WebSocket) -> None:
     hub.agent_connected = True
     hub.agent_last_seen = datetime.now(UTC)
     try:
-        await _publish(ws.app)
+        await publish_live_state(ws.app)
         while True:
             raw = await ws.receive_text()
             msg = json.loads(raw)
@@ -90,7 +90,7 @@ async def agent_ws(ws: WebSocket) -> None:
             if mtype == "hello":
                 hub.agent_hostname = msg.get("hostname")
                 hub.agent_rb_version = msg.get("rb_version")
-                await _publish(ws.app)
+                await publish_live_state(ws.app)
             elif mtype == "play":
                 event = _event_adapter.validate_python(msg["event"])
                 ingest_play(
@@ -104,7 +104,7 @@ async def agent_ws(ws: WebSocket) -> None:
                         {"type": "ack", "history_entry_id": event.history_entry_id}
                     )
                 )
-                await _publish(ws.app)
+                await publish_live_state(ws.app)
             elif mtype == "heartbeat":
                 pass
     except WebSocketDisconnect:
@@ -112,7 +112,7 @@ async def agent_ws(ws: WebSocket) -> None:
     finally:
         hub.agent_connected = False
         with contextlib.suppress(Exception):
-            await _publish(ws.app)
+            await publish_live_state(ws.app)
 
 
 @router.post("/agent/events")
@@ -129,7 +129,7 @@ async def agent_events(
         )
         for e in events
     ]
-    await _publish(app)
+    await publish_live_state(app)
     return {"ingested": sum(1 for r in results if r["inserted"])}
 
 
@@ -175,7 +175,7 @@ async def agent_start_set(
                 text("SELECT * FROM sets WHERE id = :id"), {"id": sid}
             ).mappings().one()
         )
-    await _publish(request.app)
+    await publish_live_state(request.app)
     return SetOut.model_validate(row)
 
 
@@ -190,7 +190,7 @@ async def agent_stop_set(
             raise HTTPException(404, "No active set")
         _end_set(conn, s["id"], datetime.now(UTC))
         s["ended_at"] = datetime.now(UTC)
-    await _publish(request.app)
+    await publish_live_state(request.app)
     return SetOut.model_validate(s)
 
 
@@ -232,7 +232,7 @@ async def put_auto_record(
 ) -> AutoRecordOut:
     with request.app.state.engine.begin() as conn:
         set_setting(conn, "auto_record", "1" if body.auto_record else "0")
-    await _publish(request.app)
+    await publish_live_state(request.app)
     return body
 
 
@@ -243,7 +243,7 @@ async def stale_set_sweeper(app: FastAPI) -> None:
         try:
             with app.state.engine.begin() as conn:
                 if close_stale_set(conn, datetime.now(UTC)):
-                    await _publish(app)
+                    await publish_live_state(app)
         except Exception:
             pass
 
